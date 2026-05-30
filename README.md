@@ -33,6 +33,11 @@ and search **never evict the active LLM**.
 
 ## Quick start
 
+> First time on this machine? Read **[INSTALL.md](INSTALL.md)** for the full
+> prerequisites (WSL2, Docker Desktop WSL Integration, NVIDIA driver, Rocky 10
+> setup) and a troubleshooting section. The steps below assume those are
+> already in place.
+
 ```bash
 # 1. Bootstrap the environment (idempotent)
 ./setup_ai_env.sh
