@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Aider artifacts
+.aider*
+!.aider.example
+
+# Local runtime logs
+*.log
+*.log.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Qdrant / model data should not live in the repo
+qdrant_storage/
+ollama_models/
