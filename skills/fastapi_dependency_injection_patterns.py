@@ -4,7 +4,7 @@ Theme: FastAPI dependency injection patterns
 Source chunks: 3
 Source URLs:
 - https://fastapi.tiangolo.com/tutorial/dependencies/
-Generated: 2026-05-31T18:06:39
+Generated: 2026-05-31T19:40:35
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
@@ -13,63 +13,38 @@ Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 Helper functions for FastAPI dependency injection patterns.
 
-This module provides reusable utilities for working with dependencies in FastAPI,
-including common parameter handling and dependency stacking.
+This module provides utilities to simplify working with dependencies in FastAPI,
+especially around creating reusable and annotated dependencies.
 """
 
-from fastapi import Depends, HTTPException, status
-from typing import Annotated, Any, TypeVar, Union
-from collections.abc import Callable
+from typing import Annotated
+from fastapi import Depends
 
-T = TypeVar("T")
 
-def create_common_parameters_dependency(
-    q: str | None = None, 
-    skip: int = 0, 
-    limit: int = 100
-) -> dict:
-    """Create a dependency that handles common query parameters.
-
-    Args:
-        q: Search term or filter.
-        skip: Number of items to skip.
-        limit: Maximum number of items to return.
-
-    Returns:
-        Dictionary containing the provided parameters.
+def create_shared_dependency(func: callable) -> type:
     """
-    return {"q": q, "skip": skip, "limit": limit}
-
-def AnnotatedDependency(func: Callable) -> Any:
-    """Helper to create Annotated dependencies for reuse.
-
-    This function allows creating type-annotated dependencies that can be reused
-    across multiple endpoints.
+    Creates a shared dependency from an async function.
 
     Args:
-        func: The dependency function to annotate.
+        func: The async dependency function.
 
     Returns:
-        Annotated type with the provided dependency function.
+        Type alias for the dependency with Annotated applied.
     """
     return Annotated[dict, Depends(func)]
 
-def stack_dependencies(*dependencies: Callable) -> Any:
-    """Stack multiple dependencies into a single hierarchical dependency.
 
-    This allows creating complex dependency trees by combining multiple
-    smaller dependencies.
+# Example usage (executed only when module is run directly)
+if __name__ == "__main__":
+    from fastapi import FastAPI
 
-    Args:
-        *dependencies: Functions to be stacked as dependencies.
+    app = FastAPI()
 
-    Returns:
-        Combined dependency that includes all provided functions.
-    """
-    return Annotated[dict, Depends([d for d in dependencies])]
+    async def common_params(q: str | None = None):
+        return {"q": q}
 
-__all__ = [
-    "create_common_parameters_dependency",
-    "AnnotatedDependency",
-    "stack_dependencies"
-]
+    CommonDep = create_shared_dependency(common_params)
+
+    @app.get("/items")
+    async def items(commons: CommonDep):
+        return commons

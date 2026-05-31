@@ -5,121 +5,74 @@ Source chunks: 4
 Source URLs:
 - https://dev.to/shehzan/mastering-python-async-patterns-a-complete-guide-to-asyncio-in-2026-10o6
 - https://discuss.python.org/t/asyncio-best-practices/12576
-Generated: 2026-05-31T18:15:38
+Generated: 2026-05-31T19:33:17
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helper functions for common asyncio patterns and best practices.
-
-This module provides reusable functions that implement key asyncio patterns,
-such as handling concurrent requests, batch processing, and proper async client
-setup. The goal is to make it easier to write clean, efficient, and maintainable
-asyncio code.
+Python Asyncio Best Practices
+This module provides reusable helper functions for working with asyncio, including:
+- Concurrency controls
+- Batch processing utilities
+- HTTP client management
 """
 
 import asyncio
-from contextlib import contextmanager
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, Sequence, Callable, Union
+import httpx
 
-@contextmanager
-async def async_client_context(client_class: type, timeout: float = 10.0) -> AsyncIterator[Any]:
-    """Create and manage an async client instance with specified timeout.
 
-    Args:
-        client_class: The async client class to instantiate (e.g., httpx.AsyncClient)
-        timeout: Optional timeout value for the client
-
-    Returns:
-        An async context manager that yields the client instance
+async def gather_with_concurrency(tasks: Sequence[Callable], concurrency_limit: int = 10) -> list[Any]:
     """
-    async with client_class(timeout=timeout) as client:
-        yield client
-
-async def batch_request_handler(
-    urls: List[str],
-    client: Any,
-    batch_size: int = 50,
-    rate_limit_interval: float = 1.0
-) -> List[Any]:
-    """Process URLs in batches to handle concurrency and rate limiting.
-
-    Args:
-        urls: List of URLs to process
-        client: Async client instance (e.g., httpx.AsyncClient)
-        batch_size: Number of requests per batch
-        rate_limit_interval: Seconds to wait between batches
-
-    Returns:
-        List of results from processing all URLs
+    Run tasks concurrently with a limit on the number of simultaneous tasks.
+    Returns results in the order they were received.
     """
+    if not tasks:
+        return []
+    
     results = []
-    for i in range(0, len(urls), batch_size):
-        batch = urls[i:i+batch_size]
-        batch_tasks = [scrape_page(client, url) for url in batch]
-        batch_results = await asyncio.gather(*batch_tasks)
+    task_batches = [tasks[i:i+concurrency_limit] for i in range(0, len(tasks), concurrency_limit)]
+    
+    for batch in task_batches:
+        batch_results = await asyncio.gather(*batch)
         results.extend(batch_results)
-        await asyncio.sleep(rate_limit_interval)
+        
     return results
 
-async def async_function_wrapper(func: callable, *args, **kwargs) -> Any:
-    """Execute an async function and handle the event loop.
 
-    This is useful for wrapping async functions that need to be called from
-    synchronous code or CLI scripts.
-
-    Args:
-        func: The async function to execute
-        *args: Positional arguments for the function
-        **kwargs: Keyword arguments for the function
-
-    Returns:
-        Result of the async function
+async def async_batch_request(urls: Sequence[str], client_func: Callable[[], httpx.AsyncClient]) -> list[Any]:
     """
-    return await asyncio.run(func(*args, **kwargs))
-
-def parallel_execution(tasks: List[callable]) -> Any:
-    """Execute multiple coroutines in parallel using asyncio.gather.
-
-    This is a convenience wrapper around asyncio.gather to handle the event loop.
-
-    Args:
-        tasks: List of coroutine objects or callables
-
-    Returns:
-        Result(s) from executing the tasks
+    Make concurrent HTTP requests with rate limiting and proper resource management.
+    Takes a function that returns an AsyncClient instance.
+    Returns list of responses in the order of input URLs.
     """
-    return asyncio.run(asyncio.gather(*tasks))
-
-def sequential_execution(tasks: List[callable], progress_callback: Optional[callable] = None) -> Any:
-    """Execute coroutines sequentially with optional progress feedback.
-
-    Args:
-        tasks: List of coroutine objects or callables
-        progress_callback: Optional function to call after each task completes
-
-    Returns:
-        Result(s) from executing the tasks
-    """
-    loop = asyncio.get_event_loop()
+    client = await client_func()
     results = []
-    for i, task in enumerate(tasks):
-        result = loop.run_until_complete(task())
-        results.append(result)
-        if progress_callback:
-            progress_callback(i + 1, len(tasks))
-    return results
+    
+    for i in range(0, len(urls), 50):
+        batch = urls[i:i+50]
+        async with client:
+            batch_results = await asyncio.gather(
+                *[client.get(url) for url in batch]
+            )
+            results.extend(batch_results)
+            await asyncio.sleep(1)  # Rate limiting
+        
+    return [r.json() for r in results]
+
+
+async def measure_async_task_latency(func: Callable, *args, **kwargs) -> tuple[Any, float]:
+    """
+    Measure the latency of an async function.
+    Returns (result, elapsed_time_in_seconds).
+    """
+    start = asyncio.get_event_loop().time()
+    result = await func(*args, **kwargs)
+    end = asyncio.get_event_loop().time()
+    return result, end - start
+
 
 if __name__ == "__main__":
-    # Example usage demonstration
-    import httpx
-
-    async def example_usage():
-        urls = [f"https://example.com/page/{i}" for i in range(500)]
-        client = httpx.AsyncClient()
-        results = batch_request_handler(urls, client)
-        return results
-
-    print(async_function_wrapper(example_usage()))
+    pass
