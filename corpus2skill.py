@@ -65,6 +65,41 @@ DEFAULT_RAG_ADAPTIVE_SCHEDULE: tuple[int, ...] = (0, 2, 3)
 # corrective hint を prompt に追加して再生成する最大回数。0 = 従来動作 (一発外したら break)。
 DEFAULT_QUALITY_INNER_RETRIES = 2
 
+# --- Phase 3.6 model registry + multi-model fallback 定数 ---
+# 将来の即乗せ換え用 model registry (cf. [[feedback_local_llm_research_orientation]])。
+# 新モデルを試すときは: 1) Ollama pull <name>、2) ここに 1 entry 追加、
+# 3) CLI で --primary-model <name> または --fallback-model <name> 指定。
+# YAML/JSON 外部化は Phase 3.7+ で metrics 基盤と一緒に検討予定。
+MODEL_REGISTRY: dict[str, dict[str, str | int]] = {
+    "deepseek-r1:14b": {
+        "role": "planner",
+        "size_gb": 9,
+        "notes": "reasoning 強、コード生成は弱点 (asyncio 系 import 幻覚多発、Phase 3.5 で観測)",
+    },
+    "qwen2.5-coder:7b": {
+        "role": "coder",
+        "size_gb": 5,
+        "notes": "コード忠実性高、Aider で実証済、Phase 3.6 default fallback",
+    },
+    "qwen2.5:7b-instruct": {
+        "role": "general",
+        "size_gb": 5,
+        "notes": "汎用、未評価",
+    },
+    "llama3.1:8b": {
+        "role": "general",
+        "size_gb": 5,
+        "notes": "未評価",
+    },
+}
+# 旧 DEFAULT_MODEL の意味的 alias (将来差替え時の単一変更点)
+PRIMARY_MODEL = DEFAULT_MODEL
+
+# 7B fallback (Phase 3.6 A 案: inner retry 最終段で 14B → fallback model に切替)。
+# default OFF で完全後方互換、`--enable-7b-fallback` で opt-in。
+DEFAULT_FALLBACK_MODEL = "qwen2.5-coder:7b"
+DEFAULT_ENABLE_FALLBACK = False
+
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
 Output EXACTLY one line per callable, format:
@@ -139,6 +174,9 @@ class DistillResult:
     # Phase 3.5: 各 quality retry (q_attempt) 内で実行された inner retry 数の履歴。
     # 例 (0, 2) = q_attempt 0 で inner 不要、q_attempt 1 で 2 回 inner retry を消費。
     inner_retry_history: tuple[int, ...] = ()
+    # Phase 3.6: inner retry 最終段で 7B fallback が発火したときの model 名 (例
+    # 'qwen2.5-coder:7b')。未発火または --enable-7b-fallback OFF は None。
+    fallback_model_used: str | None = None
 
 
 def fetch_chunks_by_theme(
@@ -600,6 +638,8 @@ def distill(
     rag_adaptive: bool = False,
     rag_schedule: tuple[int, ...] = DEFAULT_RAG_ADAPTIVE_SCHEDULE,
     quality_inner_retries: int = DEFAULT_QUALITY_INNER_RETRIES,
+    enable_fallback: bool = DEFAULT_ENABLE_FALLBACK,
+    fallback_model: str = DEFAULT_FALLBACK_MODEL,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -636,6 +676,7 @@ def distill(
     rag_chunks: list[dict] = []
     rag_top_k_history: list[int] = []
     inner_retry_history: list[int] = []  # Phase 3.5: 各 q_attempt の inner retry 数
+    fallback_model_used: str | None = None  # Phase 3.6: 7B fallback 発火時の model 名
     if rag_augmented:
         rag_chunks = retrieve_rag_chunks(
             qd, theme,
@@ -725,6 +766,7 @@ def distill(
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                 rag_top_k_history=tuple(rag_top_k_history),
                 inner_retry_history=tuple(inner_retry_history),
+                fallback_model_used=fallback_model_used,
             )
 
         # L2: import 検証 (ファイルを実 path に書いて subprocess import)
@@ -761,6 +803,7 @@ def distill(
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                 rag_top_k_history=tuple(rag_top_k_history),
                 inner_retry_history=tuple(inner_retry_history),
+                fallback_model_used=fallback_model_used,
             )
 
         # Phase 3.2 quality loop: L4 (mypy) + L5 (Gemini) を最大 quality_max_retries 回
@@ -791,6 +834,7 @@ def distill(
                     skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                     rag_top_k_history=tuple(rag_top_k_history),
                     inner_retry_history=tuple(inner_retry_history),
+                    fallback_model_used=fallback_model_used,
                 )
             final_feedback = feedback
             if q_attempt >= quality_max_retries:
@@ -845,15 +889,32 @@ def distill(
             last_inner_err: str = ""
             inner_prompt = q_prompt_base
             for inner_attempt in range(quality_inner_retries + 1):
+                # Phase 3.6: 最終 inner retry (inner_attempt == quality_inner_retries)
+                # かつ inner_attempt > 0 (= retry 1 回以上消費後の最終段) のとき、
+                # --enable-7b-fallback で fallback_model に切替。inner_attempt == 0 を
+                # 除外することで quality_inner_retries=0 の縮退ケースが 7B 即発火に
+                # ならないことを保護 (backward compat)。
+                active_model = model
+                is_final_inner = (
+                    inner_attempt > 0
+                    and inner_attempt == quality_inner_retries
+                )
+                if enable_fallback and is_final_inner:
+                    active_model = fallback_model
+                    fallback_model_used = active_model
                 if inner_attempt > 0:
                     inner_used = inner_attempt
+                    fallback_note = (
+                        f" [FALLBACK {model} → {active_model}]"
+                        if active_model != model else ""
+                    )
                     print(
                         f"      [L4+L5 inner] retry "
                         f"{inner_attempt}/{quality_inner_retries}: "
-                        f"re-generating with corrective hint"
+                        f"re-generating with corrective hint{fallback_note}"
                     )
                 try:
-                    raw = call_14b(inner_prompt, model=model, timeout=timeout)
+                    raw = call_14b(inner_prompt, model=active_model, timeout=timeout)
                 except requests.exceptions.RequestException as e:
                     print(
                         f"      [WARN] quality retry: 14B request failed: {e}",
@@ -966,6 +1027,7 @@ def distill(
             skill_path=path, elapsed_sec=elapsed, attempts=attempt,
             rag_top_k_history=tuple(rag_top_k_history),
             inner_retry_history=tuple(inner_retry_history),
+            fallback_model_used=fallback_model_used,
         )
 
     elapsed = time.time() - t0
@@ -975,6 +1037,7 @@ def distill(
         skill_path=None, elapsed_sec=elapsed, attempts=attempts,
         rag_top_k_history=tuple(rag_top_k_history),
         inner_retry_history=tuple(inner_retry_history),
+        fallback_model_used=fallback_model_used,
     )
 
 
@@ -990,7 +1053,19 @@ def main() -> int:
         help="payload.theme と一致する theme 文字列 (exact match)",
     )
     ap.add_argument("--collection", default=DEFAULT_COLLECTION)
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    # Phase 3.6: --primary-model が canonical、--model は後方互換 alias (dest=model 維持)
+    ap.add_argument(
+        "--primary-model", "--model", dest="model", default=PRIMARY_MODEL,
+        help=(
+            f"primary distillation model (default {PRIMARY_MODEL!r}、MODEL_REGISTRY 参照)。"
+            "新モデル即乗せ換えのため --primary-model を canonical 名として推奨、"
+            "--model は backward compatible alias。"
+        ),
+    )
+    ap.add_argument(
+        "--list-models", action="store_true",
+        help="MODEL_REGISTRY を表示して exit (model 選定の参考用、Phase 3.6)",
+    )
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     ap.add_argument("--max-retries", type=int, default=MAX_RETRIES)
     ap.add_argument(
@@ -1072,7 +1147,38 @@ def main() -> int:
             f"(default {DEFAULT_QUALITY_INNER_RETRIES}、0=従来動作、Phase 3.5)"
         ),
     )
+    # --- Phase 3.6 multi-model fallback 引数 ---
+    ap.add_argument(
+        "--enable-7b-fallback", action="store_true",
+        help=(
+            "quality inner retry 最終段 (inner_attempt == quality_inner_retries かつ "
+            ">0) で primary model → fallback model に切替 (Phase 3.6、default OFF)"
+        ),
+    )
+    ap.add_argument(
+        "--fallback-model", default=DEFAULT_FALLBACK_MODEL,
+        help=(
+            f"fallback 時に使う Ollama model "
+            f"(default {DEFAULT_FALLBACK_MODEL!r}、MODEL_REGISTRY 参照)"
+        ),
+    )
     args = ap.parse_args()
+
+    # --list-models: registry を表示して即 exit (Phase 3.6)
+    if args.list_models:
+        print("Phase 3.6 MODEL_REGISTRY:")
+        for name, meta in MODEL_REGISTRY.items():
+            marker = (
+                " (PRIMARY default)" if name == PRIMARY_MODEL
+                else " (FALLBACK default)" if name == DEFAULT_FALLBACK_MODEL
+                else ""
+            )
+            print(
+                f"  {name:30s}  role={meta['role']:8s}  "
+                f"size={meta['size_gb']}GB{marker}"
+            )
+            print(f"    notes: {meta['notes']}")
+        return 0
 
     # --rag-adaptive-schedule を tuple[int, ...] へ parse
     try:
@@ -1126,6 +1232,8 @@ def main() -> int:
         rag_adaptive=args.rag_adaptive,
         rag_schedule=rag_schedule_parsed,
         quality_inner_retries=args.quality_inner_retries,
+        enable_fallback=args.enable_7b_fallback,
+        fallback_model=args.fallback_model,
     )
     if not result.valid:
         print(
@@ -1154,6 +1262,8 @@ def main() -> int:
         print(f"rag_top_k: {list(result.rag_top_k_history)}")
     if result.inner_retry_history:
         print(f"inner_retry: {list(result.inner_retry_history)}")
+    if result.fallback_model_used:
+        print(f"fallback: {result.fallback_model_used} (fired at inner retry final)")
     print(f"elapsed:  {result.elapsed_sec:.1f}s")
     if result.error:
         # quality_loop=True で valid=True だが品質残課題ありの warning

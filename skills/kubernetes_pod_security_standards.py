@@ -4,72 +4,85 @@ Theme: Kubernetes pod security standards
 Source chunks: 1
 Source URLs:
 - https://kubernetes.io/docs/concepts/security/pod-security-standards/
-Generated: 2026-05-31T23:55:51
+Generated: 2026-06-01T01:20:22
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Kubernetes Pod Security Standards Helper Module
-
-This module provides utility functions to validate Kubernetes pod security standards based on:
-- Seccomp profile configurations
-- Sysctl restrictions
-
-Functions:
- - is_seccomp_profile_compliant(pod): Validates seccomp profiles for containers, initContainers, and ephemeralContainers
- - are_sysctls_compliant(sysctl_names): Validates sysctl names against allowed list
+Kubernetes Pod Security Standards Helper Functions
+This module provides reusable functions to validate pod security configurations against Kubernetes' Pod Security Standards (PSS).
 """
 
-from typing import Set, Optional, Dict
+from typing import Optional, Dict, List
 
-# Constants
-ALLOWED_SECCOMP_TYPES: Set[str] = {'RuntimeDefault', 'Localhost'}
-ALLOWED_SYSCTLS: Set[str] = {
-    'kernel.shm_rmid_forced',
-    'net.ipv4.ip_local_port_range',
-    'net.ipv4.ip_unprivileged_port_start',
-    'net.ipv4.tcp_syncookies',
-    'net.ipv4.ping_group_range',
-    'net.ipv4.ip_local_reserved_ports',
-    'net.ipv4.tcp_keepalive_time',
-    'net.ipv4.tcp_fin_timeout',
-    'net.ipv4.tcp_keepalive_intvl',
-    'net.ipv4.tcp_keepalive_probes'
-}
+# Type aliases
+SecurityContext = Dict[str, Optional[str]]
+PodSpec = Dict[str, Dict[str, List[SecurityContext]]]
 
-def is_seccomp_profile_compliant(pod: Dict) -> bool:
+def is_valid_seccomp_profile(seccomp_type: str) -> bool:
     """
-    Validate seccomp profiles for containers, initContainers, and ephemeralContainers.
-
-    Args:
-        pod: Kubernetes Pod specification dictionary
-
-    Returns:
-        bool: True if all containers have valid seccomp profiles, False otherwise
-    """
-    components = [
-        pod.get('spec', {}).get('containers', []),
-        pod.get('spec', {}).get('initContainers', []),
-        pod.get('spec', {}).get('ephemeralContainers', [])
-    ]
+    Check if a seccomp profile type is allowed by Kubernetes PSS.
     
-    for component in components:
-        for container in component:
-            seccomp_type: Optional[str] = container.get('securityContext', {}).get('seccompProfile', {}).get('type')
-            if seccomp_type not in ALLOWED_SECCOMP_TYPES and seccomp_type is not None:
-                return False
-    return True
-
-def are_sysctls_compliant(sysctl_names: Set[str]) -> bool:
-    """
-    Validate sysctl names against allowed list.
-
     Args:
-        sysctl_names: Set of sysctl names to validate
-
+        seccomp_type (str): Type of seccomp profile to check
+        
     Returns:
-        bool: True if all sysctl names are allowed, False otherwise
+        bool: True if valid, False otherwise
     """
-    return sysctl_names.issubset(ALLOWED_SYSCTLS)
+    return seccomp_type in {'RuntimeDefault', 'Localhost'}
+
+def _get_allowed_sysctls() -> List[str]:
+    """
+    Return the list of allowed sysctl names per Kubernetes PSS.
+    
+    Returns:
+        List[str]: Allowed sysctl names
+    """
+    return [
+        'kernel.shm_rmid_forced',
+        'net.ipv4.ip_local_port_range',
+        'net.ipv4.ip_unprivileged_port_start',
+        'net.ipv4.tcp_syncookies',
+        'net.ipv4.ping_group_range',
+        'net.ipv4.ip_local_reserved_ports',  # since Kubernetes 1.27
+        'net.ipv4.tcp_keepalive_time',       # since Kubernetes 1.29
+        'net.ipv4.tcp_fin_timeout',
+        'net.ipv4.tcp_keepalive_intvl',
+        'net.ipv4.tcp_keepalive_probes'
+    ]
+
+def validate_seccomp_and_sysctls(pod_spec: PodSpec) -> bool:
+    """
+    Validate pod security configuration against Kubernetes PSS for seccomp and sysctls.
+    
+    Args:
+        pod_spec (PodSpec): Dictionary representing the pod specification
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    allowed_sysctls = _get_allowed_sysctls()
+    
+    def check_container_security(containers_path: str) -> None:
+        containers = pod_spec.get('containers', [])
+        for container in containers[containers_path]:
+            sc = container['securityContext']
+            
+            # Check seccomp profile
+            if not is_valid_seccomp_profile(sc.get('seccompProfile', {}).get('type', '')):
+                raise ValueError("Invalid seccomp profile type")
+            
+            # Check sysctls
+            for sysctl in sc.get('sysctls', []):
+                if sysctl['name'] not in allowed_sysctls:
+                    raise ValueError(f"Disallowed sysctl: {sysctl['name']}")
+    
+    try:
+        check_container_security("[*]")
+        return True
+    except (KeyError, ValueError) as e:
+        return False
+
+__all__ = ['is_valid_seccomp_profile', 'validate_seccomp_and_sysctls']

@@ -5,79 +5,83 @@ Source chunks: 4
 Source URLs:
 - https://dev.to/shehzan/mastering-python-async-patterns-a-complete-guide-to-asyncio-in-2026-10o6
 - https://discuss.python.org/t/asyncio-best-practices/12576
-Generated: 2026-05-31T23:39:53
+Generated: 2026-06-01T00:54:17
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helpers for working with Python's asyncio module.
+Helper functions for working with Python's asyncio module following best practices.
 
-This module provides reusable functions for managing asynchronous tasks,
-handling HTTP clients, and processing items in batches.
+This module provides reusable utilities for asynchronous programming,
+including task management, batch processing, and safe event loop handling.
 """
 
 import asyncio
-from contextlib import contextmanager
 
-@contextmanager
-async def async_client_context(client_cls, *args, **kwargs):
-    """Context manager for creating and handling an asynchronous client.
-    
-    Args:
-        client_cls: The class of the asynchronous client (e.g., httpx.AsyncClient)
-        *args: Positional arguments for initializing the client
-        **kwargs: Keyword arguments for initializing the client
-    
-    Yields:
-        An instance of the asynchronous client
+
+def run_async_tasks(coro_functions, *args, **kwargs):
     """
-    async with client_cls(*args, **kwargs) as client:
-        yield client
+    Run multiple async coroutines concurrently and return their results.
 
-async def run_async_task(coro_func, *args, **kwargs):
-    """Run an asynchronous function and await its completion.
-    
     Args:
-        coro_func: The coroutine function to execute
-        *args: Positional arguments for the coroutine function
-        **kwargs: Keyword arguments for the coroutine function
-    
+        coro_functions (list): List of coroutine functions to execute
+        args: Arguments passed to each coroutine function
+        kwargs: Keyword arguments passed to each coroutine function
+
     Returns:
-        The result of the coroutine function
+        list: List of results from all coroutine executions
     """
-    return await coro_func(*args, **kwargs)
+    loop = asyncio.get_event_loop_policy().get_event_loop()
+    tasks = [coro_function(*args, **kwargs) for coro_function in coro_functions]
+    return loop.run_until_complete(asyncio.gather(*tasks))
 
-async def batch_process(items, process_func, batch_size=100):
-    """Process items in batches asynchronously.
-    
+
+def batch_run(tasks, batch_size=50, delay_between_batches=1, **kwargs):
+    """
+    Process async tasks in batches to control concurrency and enforce rate limits.
+
     Args:
-        items: List of items to process
-        process_func: Async function that processes each item
-        batch_size: Number of items to process per batch
-    
+        tasks (list): List of tasks/coroutines to execute
+        batch_size (int): Number of tasks per batch
+        delay_between_batches (float): Seconds to wait between each batch
+        kwargs: Additional arguments for task execution
+
     Returns:
-        List of results from processing all items
+        list: Aggregated results from all tasks
     """
     results = []
-    for i in range(0, len(items), batch_size):
-        batch = items[i:i+batch_size]
-        batch_results = await asyncio.gather(
-            *[process_func(item) for item in batch]
-        )
+    for i in range(0, len(tasks), batch_size):
+        batch = tasks[i:i+batch_size]
+        batch_results = asyncio.run(batch_process(batch, **kwargs))
         results.extend(batch_results)
-        await asyncio.sleep(1)  # Rate limiting
+        if delay_between_batches > 0:
+            asyncio.sleep(delay_between_batches)
     return results
 
-# Example usage (only included if necessary; not part of the main module exports):
+
+def create_event_loop_safe():
+    """
+    Create an event loop safely, ensuring it's not already running.
+
+    Returns:
+        asyncio.EventLoop: A new or existing event loop
+    """
+    policy = asyncio.get_event_loop_policy()
+    if policy.get_event_loop().is_running():
+        return policy.get_event_loop()
+    else:
+        return policy.new_event_loop()
+
+
 if __name__ == "__main__":
     import httpx
-    
-    async def fetch_user(client, user_id):
-        response = await client.get(f"https://api.example.com/users/{user_id}")
-        return response.json()
-    
-    # Usage example:
-    # users = [1, 2, 3]
-    # results = asyncio.run(batch_process(users, lambda u: fetch_user(httpx.AsyncClient(), u)))
+
+    async def example_task(client, url):
+        response = await client.get(url)
+        return len(response.text)
+
+    urls = ["https://example.com"] * 10
+    tasks = [example_task(httpx.AsyncClient(), url) for url in urls]
+    print(batch_run(tasks))
