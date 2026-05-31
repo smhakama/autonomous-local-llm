@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import fcntl
 import hashlib
+import subprocess
 import sys
 import time
 import uuid
@@ -451,6 +452,71 @@ def demo_search(qd: QdrantClient, query: str, top: int = 5) -> None:
         print(f"      | {head}")
 
 
+ASK_GEMINI_PROMPT_TEMPLATE = (
+    "Generate {n} alternative search queries for the topic below. "
+    "Output ONLY the queries, one per line, no numbering, no quotes, "
+    "no commentary, no markdown.\nTopic: {theme}"
+)
+
+
+def expand_query_via_gemini(
+    theme: str,
+    bin_path: str = "ask_gemini",
+    limit: int = 5,
+    timeout_sec: int = 30,
+) -> list[str]:
+    """ask_gemini で検索ワード拡張。返値は [theme, expanded_1, ...] (重複除去済)。
+
+    失敗時 (timeout / 不在 / 非 0 終了) は [theme] にフォールバック (継続)。
+    """
+    prompt = ASK_GEMINI_PROMPT_TEMPLATE.format(n=limit, theme=theme)
+    try:
+        r = subprocess.run(
+            [bin_path, prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[WARN] ask_gemini timeout ({timeout_sec}s) for {theme!r}, "
+            f"fallback to single query",
+            file=sys.stderr,
+        )
+        return [theme]
+    except FileNotFoundError:
+        print(
+            f"[WARN] ask_gemini not found ({bin_path!r}), "
+            f"fallback to single query",
+            file=sys.stderr,
+        )
+        return [theme]
+
+    if r.returncode != 0:
+        msg = (r.stderr or "").strip()[:200]
+        print(
+            f"[WARN] ask_gemini rc={r.returncode} for {theme!r}: {msg}",
+            file=sys.stderr,
+        )
+        return [theme]
+
+    seen: set[str] = {theme.lower()}
+    queries: list[str] = [theme]
+    for line in r.stdout.splitlines():
+        q = line.strip().strip('"').strip("'")
+        if not q or q.lower() in seen:
+            continue
+        seen.add(q.lower())
+        queries.append(q)
+        if len(queries) >= limit + 1:  # +1 for original theme
+            break
+
+    print(f"[expand-query] {len(queries)} queries ({len(queries) - 1} expanded)")
+    for i, q in enumerate(queries):
+        print(f"  [{i}] {q}")
+    return queries
+
+
 def parse_themes_file(path: str) -> list[str]:
     """themes.txt をパースして正規化済 theme リストを返す。
 
@@ -482,16 +548,47 @@ def parse_themes_file(path: str) -> list[str]:
     return themes
 
 
-async def run_research(theme: str, max_pages: int) -> int:
+async def run_research(
+    theme: str,
+    max_pages: int,
+    *,
+    expand_query: bool = False,
+    expand_limit: int = 5,
+    ask_gemini_bin: str = "ask_gemini",
+    ask_gemini_timeout: int = 30,
+) -> int:
     print(f"=== theme: {theme!r} ===")
     print(f"=== embed model: {EMBED_MODEL} ===")
     qd = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     ensure_collection(qd)
 
+    queries = (
+        expand_query_via_gemini(
+            theme,
+            bin_path=ask_gemini_bin,
+            limit=expand_limit,
+            timeout_sec=ask_gemini_timeout,
+        )
+        if expand_query
+        else [theme]
+    )
+
     t0 = time.time()
-    urls = discover_urls_via_ddg(theme, max_pages=max_pages)
+    seen_urls: set[str] = set()
+    all_urls: list[str] = []
+    for q in queries:
+        for u in discover_urls_via_ddg(q, max_pages=max_pages):
+            if u not in seen_urls:
+                seen_urls.add(u)
+                all_urls.append(u)
+    # 全クエリで集約後、ドメイン優先度で再ソートし top-N 採用
+    ranked = sorted(all_urls, key=lambda u: (-_domain_score(u), all_urls.index(u)))
+    urls = ranked[:max_pages]
     discover_secs = time.time() - t0
-    print(f"discover: {discover_secs:.1f}s, {len(urls)} 件採用")
+    print(
+        f"discover: {discover_secs:.1f}s, "
+        f"{len(queries)} queries → {len(all_urls)} unique URLs → {len(urls)} 採用"
+    )
 
     if not urls:
         print("[ERROR] no article URLs discovered", file=sys.stderr)
@@ -577,7 +674,14 @@ async def amain(args: argparse.Namespace) -> int:
             for i, theme in enumerate(themes, 1):
                 print(f"\n=== [{i}/{len(themes)}] theme: {theme!r} ===")
                 try:
-                    rc = await run_research(theme, args.max_pages)
+                    rc = await run_research(
+                        theme,
+                        args.max_pages,
+                        expand_query=args.expand_query,
+                        expand_limit=args.expand_limit,
+                        ask_gemini_bin=args.ask_gemini_bin,
+                        ask_gemini_timeout=args.ask_gemini_timeout,
+                    )
                     if rc != 0:
                         failed.append(theme)
                         if args.strict:
@@ -617,7 +721,14 @@ async def amain(args: argparse.Namespace) -> int:
         )
         return 2
 
-    return await run_research(args.theme, args.max_pages)
+    return await run_research(
+        args.theme,
+        args.max_pages,
+        expand_query=args.expand_query,
+        expand_limit=args.expand_limit,
+        ask_gemini_bin=args.ask_gemini_bin,
+        ask_gemini_timeout=args.ask_gemini_timeout,
+    )
 
 
 def main() -> int:
@@ -649,6 +760,22 @@ def main() -> int:
     ap.add_argument(
         "--strict", action="store_true",
         help="themes-file mode: stop on first failure (default: continue)",
+    )
+    ap.add_argument(
+        "--expand-query", action="store_true",
+        help="ask_gemini で検索ワード拡張 (default OFF, Phase 2.1c)",
+    )
+    ap.add_argument(
+        "--expand-limit", type=int, default=5,
+        help="--expand-query 時の最大拡張クエリ数 (default 5)",
+    )
+    ap.add_argument(
+        "--ask-gemini-bin", default="ask_gemini",
+        help="ask_gemini wrapper の path (default: PATH 検索)",
+    )
+    ap.add_argument(
+        "--ask-gemini-timeout", type=int, default=30,
+        help="ask_gemini 呼出 timeout 秒 (default 30)",
     )
     args = ap.parse_args()
     return asyncio.run(amain(args))
