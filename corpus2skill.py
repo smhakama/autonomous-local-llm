@@ -60,6 +60,11 @@ RAG_EMBED_MODEL = "bge-m3"
 # default = "0→2→3" (初回 OFF → quality FAIL なら top_k=2 → さらに FAIL なら top_k=3)
 DEFAULT_RAG_ADAPTIVE_SCHEDULE: tuple[int, ...] = (0, 2, 3)
 
+# --- Phase 3.5 quality-retry inner retry 定数 ---
+# quality retry 内で L2 (import) / L3 (callables) 失敗時、同じ q_attempt のまま
+# corrective hint を prompt に追加して再生成する最大回数。0 = 従来動作 (一発外したら break)。
+DEFAULT_QUALITY_INNER_RETRIES = 2
+
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
 Output EXACTLY one line per callable, format:
@@ -131,6 +136,9 @@ class DistillResult:
     elapsed_sec: float
     attempts: int
     rag_top_k_history: tuple[int, ...] = ()
+    # Phase 3.5: 各 quality retry (q_attempt) 内で実行された inner retry 数の履歴。
+    # 例 (0, 2) = q_attempt 0 で inner 不要、q_attempt 1 で 2 回 inner retry を消費。
+    inner_retry_history: tuple[int, ...] = ()
 
 
 def fetch_chunks_by_theme(
@@ -176,6 +184,95 @@ def validate_python_syntax(code: str) -> tuple[bool, str | None]:
         return True, None
     except SyntaxError as e:
         return False, f"SyntaxError at line {e.lineno}: {e.msg}"
+
+
+# --- Phase 3.5 corrective hint extraction ---
+# 14B が幻覚しやすい代表症状 4 種に対し、prompt に注入する 1 行 hint を生成する。
+# Phase 3.3 v3 asyncio domain で観測された `module 'asyncio' has no attribute 'Coroutine'`
+# のような symbol 幻覚を、retry 時に明示的に矯正する目的。
+
+_TYPING_LIKE_MODULES = frozenset({"typing", "collections.abc", "typing_extensions"})
+
+_IMPORT_ERROR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # AttributeError: module 'X' has no attribute 'Y'[. Did you mean: 'Z'?]
+    (
+        re.compile(
+            r"AttributeError: module '(?P<mod>[\w\.]+)' has no attribute "
+            r"'(?P<attr>\w+)'(?:\. Did you mean: '(?P<suggest>\w+)'\?)?"
+        ),
+        "attr",
+    ),
+    # NameError: name 'X' is not defined
+    (
+        re.compile(r"NameError: name '(?P<name>\w+)' is not defined"),
+        "name",
+    ),
+    # ModuleNotFoundError: No module named 'X'
+    (
+        re.compile(r"ModuleNotFoundError: No module named '(?P<mod>[\w\.]+)'"),
+        "module",
+    ),
+    # ImportError: cannot import name 'X' from 'Y'
+    (
+        re.compile(
+            r"ImportError: cannot import name '(?P<name>\w+)' from '(?P<mod>[\w\.]+)'"
+        ),
+        "import",
+    ),
+)
+
+
+def extract_import_error_hint(err: str | None) -> str | None:
+    """L2 import 失敗時のエラー文字列から、14B 向けの矯正 hint を 1 行生成する。
+
+    既知 4 種 (AttributeError / NameError / ModuleNotFoundError / ImportError) を
+    複数行 traceback の末尾優先でマッチ。マッチなしは None (上位で feedback のみ流す)。
+    """
+    if not err:
+        return None
+    for line in reversed(err.splitlines()):
+        line = line.strip()
+        for pat, kind in _IMPORT_ERROR_PATTERNS:
+            m = pat.search(line)
+            if not m:
+                continue
+            if kind == "attr":
+                mod = m["mod"]
+                attr = m["attr"]
+                suggest = m.group("suggest")
+                base = f"'{mod}.{attr}' does not exist."
+                if suggest and suggest != attr:
+                    base += f" Python suggested '{mod}.{suggest}' as the nearest name."
+                if mod in _TYPING_LIKE_MODULES:
+                    base += (
+                        f" Verify the actual public API of '{mod}' "
+                        "(e.g. use 'collections.abc' for runtime generic types)."
+                    )
+                else:
+                    base += (
+                        f" Verify the actual public API of '{mod}' — "
+                        "for generic types use 'typing' or 'collections.abc' instead "
+                        "(e.g. 'from typing import Coroutine')."
+                    )
+                return base
+            if kind == "name":
+                return (
+                    f"Name '{m['name']}' is referenced but never imported or defined. "
+                    "Either import it at the top of the module, define it as a def/class, "
+                    "or remove the reference."
+                )
+            if kind == "module":
+                return (
+                    f"Module '{m['mod']}' does not exist or is not installed. "
+                    "Use only stdlib or the framework being documented; "
+                    "do not invent package names."
+                )
+            if kind == "import":
+                return (
+                    f"'{m['name']}' is not exported by '{m['mod']}'. "
+                    f"Verify the actual public API of '{m['mod']}' before importing."
+                )
+    return None
 
 
 def build_distillation_prompt(
@@ -502,6 +599,7 @@ def distill(
     rag_max_chars: int = DEFAULT_RAG_MAX_CHARS,
     rag_adaptive: bool = False,
     rag_schedule: tuple[int, ...] = DEFAULT_RAG_ADAPTIVE_SCHEDULE,
+    quality_inner_retries: int = DEFAULT_QUALITY_INNER_RETRIES,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -537,6 +635,7 @@ def distill(
 
     rag_chunks: list[dict] = []
     rag_top_k_history: list[int] = []
+    inner_retry_history: list[int] = []  # Phase 3.5: 各 q_attempt の inner retry 数
     if rag_augmented:
         rag_chunks = retrieve_rag_chunks(
             qd, theme,
@@ -625,6 +724,7 @@ def distill(
                 raw_response=raw, extracted_code=code, valid=True, error=None,
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                 rag_top_k_history=tuple(rag_top_k_history),
+                inner_retry_history=tuple(inner_retry_history),
             )
 
         # L2: import 検証 (ファイルを実 path に書いて subprocess import)
@@ -660,6 +760,7 @@ def distill(
                 raw_response=raw, extracted_code=code, valid=True, error=None,
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                 rag_top_k_history=tuple(rag_top_k_history),
+                inner_retry_history=tuple(inner_retry_history),
             )
 
         # Phase 3.2 quality loop: L4 (mypy) + L5 (Gemini) を最大 quality_max_retries 回
@@ -689,6 +790,7 @@ def distill(
                     raw_response=raw, extracted_code=code, valid=True, error=None,
                     skill_path=path, elapsed_sec=elapsed, attempts=attempt,
                     rag_top_k_history=tuple(rag_top_k_history),
+                    inner_retry_history=tuple(inner_retry_history),
                 )
             final_feedback = feedback
             if q_attempt >= quality_max_retries:
@@ -729,61 +831,127 @@ def distill(
                     theme, chunks, rag_chunks=adapt_rag_chunks,
                 )
                 print(f"      [RAG-adaptive] prompt size: {len(prompt)} chars")
-            q_prompt = prompt + (
+            q_prompt_base = prompt + (
                 f"\n\nQUALITY ISSUES FROM PREVIOUS GENERATION:\n{feedback}\n\n"
                 f"Regenerate the entire module fixing these specific issues. "
                 f"Keep correct functions intact. Output ONLY ```python``` block."
             )
-            try:
-                raw = call_14b(q_prompt, model=model, timeout=timeout)
-            except requests.exceptions.RequestException as e:
+            # --- Phase 3.5 inner retry: L2/L3 fail 時に corrective hint で
+            # 同じ q_attempt のまま最大 quality_inner_retries 回再生成。
+            # 全 inner 使い切ったら従来通り backup 復元 + outer break (fail-safe 維持)。
+            inner_succeeded = False
+            inner_abort = False           # 14B request 失敗等の不可逆系
+            inner_used = 0                # 実際に消費した inner retry 回数
+            last_inner_err: str = ""
+            inner_prompt = q_prompt_base
+            for inner_attempt in range(quality_inner_retries + 1):
+                if inner_attempt > 0:
+                    inner_used = inner_attempt
+                    print(
+                        f"      [L4+L5 inner] retry "
+                        f"{inner_attempt}/{quality_inner_retries}: "
+                        f"re-generating with corrective hint"
+                    )
+                try:
+                    raw = call_14b(inner_prompt, model=model, timeout=timeout)
+                except requests.exceptions.RequestException as e:
+                    print(
+                        f"      [WARN] quality retry: 14B request failed: {e}",
+                        file=sys.stderr,
+                    )
+                    inner_abort = True
+                    break
+                cleaned = strip_think(raw)
+                candidate = extract_code_block(cleaned)
+                if not candidate:
+                    last_inner_err = "no Python code block in 14B response"
+                    print(
+                        f"      [WARN] quality inner: {last_inner_err}",
+                        file=sys.stderr,
+                    )
+                    inner_prompt = q_prompt_base + (
+                        "\n\nPREVIOUS INNER ATTEMPT FAILED: produced no ```python``` "
+                        "code block. Output ONLY a single ```python``` block, nothing else."
+                    )
+                    continue
+                s_ok, s_err = validate_python_syntax(candidate)
+                if not s_ok:
+                    last_inner_err = f"L1 syntax: {s_err}"
+                    print(
+                        f"      [WARN] quality inner: {last_inner_err}",
+                        file=sys.stderr,
+                    )
+                    inner_prompt = q_prompt_base + (
+                        f"\n\nPREVIOUS INNER ATTEMPT FAILED L1 (syntax): {s_err}. "
+                        "Fix the syntax error and try again."
+                    )
+                    continue
+                new_path = write_skill(
+                    theme, candidate, list(source_urls), len(chunks), model,
+                )
+                imp_ok, imp_err, new_callables = verify_import(new_path)
+                if not imp_ok:
+                    last_inner_err = f"L2 import: {imp_err}"
+                    hint = extract_import_error_hint(imp_err)
+                    print(
+                        f"      [WARN] quality inner: import fail "
+                        f"{(imp_err or '')[:160]}",
+                        file=sys.stderr,
+                    )
+                    if hint:
+                        print(f"      [hint] {hint}", file=sys.stderr)
+                    # corrective hint があれば prompt 先頭に明示挿入、なければ raw error のみ
+                    hint_block = (
+                        f"\n\nPREVIOUS INNER ATTEMPT FAILED L2 (import):\n"
+                        f"{(imp_err or '').strip()}\n"
+                    )
+                    if hint:
+                        hint_block += f"\nCORRECTIVE GUIDANCE: {hint}\n"
+                    hint_block += (
+                        "Names referenced must all be imported at the top or "
+                        "defined as def/class in this module. Do NOT invent "
+                        "symbols that do not exist in the named module."
+                    )
+                    inner_prompt = q_prompt_base + hint_block
+                    # 退避: 失敗 skill は backup で上書き (path 自体は次 inner で再生成)
+                    new_path.write_text(backup_text, encoding="utf-8")
+                    continue
+                if not new_callables:
+                    last_inner_err = "L3 no callables"
+                    print(
+                        f"      [WARN] quality inner: {last_inner_err}",
+                        file=sys.stderr,
+                    )
+                    inner_prompt = q_prompt_base + (
+                        "\n\nPREVIOUS INNER ATTEMPT FAILED L3: imported but exposed "
+                        "no top-level def/class. You MUST define at least one "
+                        "reusable function or class at module top level."
+                    )
+                    new_path.write_text(backup_text, encoding="utf-8")
+                    continue
+                # L1+L2+L3 全 PASS、次 outer q_attempt のバックアップに昇格
+                backup_text = new_path.read_text(encoding="utf-8")
+                path = new_path
+                code = candidate
+                callables = new_callables
+                inner_succeeded = True
+                break
+            inner_retry_history.append(inner_used)
+            if inner_abort:
+                # 14B 通信障害等は inner で復活不能、quality loop 終了
+                break
+            if not inner_succeeded:
+                # inner 全消費しても回復せず → 従来動作: backup 復元 + outer break
                 print(
-                    f"      [WARN] quality retry: 14B request failed: {e}",
+                    f"      [WARN] quality inner: exhausted "
+                    f"{quality_inner_retries} retries (last err: "
+                    f"{last_inner_err[:120]}), restoring previous skill and "
+                    f"aborting quality loop",
                     file=sys.stderr,
                 )
+                path.write_text(backup_text, encoding="utf-8")
                 break
-            cleaned = strip_think(raw)
-            candidate = extract_code_block(cleaned)
-            if not candidate:
-                print(
-                    "      [WARN] quality retry: no code block, "
-                    "abort quality loop",
-                    file=sys.stderr,
-                )
-                break
-            s_ok, s_err = validate_python_syntax(candidate)
-            if not s_ok:
-                print(
-                    f"      [WARN] quality retry: syntax err {s_err}, "
-                    f"abort quality loop",
-                    file=sys.stderr,
-                )
-                break
-            new_path = write_skill(
-                theme, candidate, list(source_urls), len(chunks), model,
-            )
-            imp_ok, imp_err, new_callables = verify_import(new_path)
-            if not imp_ok:
-                print(
-                    f"      [WARN] quality retry: import fail {imp_err}, "
-                    f"restoring previous skill and aborting quality loop",
-                    file=sys.stderr,
-                )
-                new_path.write_text(backup_text, encoding="utf-8")
-                break
-            if not new_callables:
-                print(
-                    "      [WARN] quality retry: no callables, "
-                    "restoring previous skill and aborting quality loop",
-                    file=sys.stderr,
-                )
-                new_path.write_text(backup_text, encoding="utf-8")
-                break
-            # この retry の skill は L1+L2+L3 PASS、次 retry のバックアップに昇格
-            backup_text = new_path.read_text(encoding="utf-8")
-            path = new_path
-            code = candidate
-            callables = new_callables
+            # inner_succeeded=True 時の path/code/callables 更新は inner loop 内で完了済
 
         # 全 quality retry 後も issue 残る、最後の skill 保持で valid=True (warning)
         elapsed = time.time() - t0
@@ -797,6 +965,7 @@ def distill(
             error=f"quality issues remained: {final_feedback[:300]}",
             skill_path=path, elapsed_sec=elapsed, attempts=attempt,
             rag_top_k_history=tuple(rag_top_k_history),
+            inner_retry_history=tuple(inner_retry_history),
         )
 
     elapsed = time.time() - t0
@@ -805,6 +974,7 @@ def distill(
         raw_response=raw, extracted_code=code, valid=False, error=last_err,
         skill_path=None, elapsed_sec=elapsed, attempts=attempts,
         rag_top_k_history=tuple(rag_top_k_history),
+        inner_retry_history=tuple(inner_retry_history),
     )
 
 
@@ -892,6 +1062,16 @@ def main() -> int:
             "schedule[q_attempt] = その retry での top_k、0 = RAG OFF。"
         ),
     )
+    # --- Phase 3.5 inner retry 引数 ---
+    ap.add_argument(
+        "--quality-inner-retries", type=int,
+        default=DEFAULT_QUALITY_INNER_RETRIES,
+        help=(
+            f"quality retry 内で L2 (import) / L3 (callables) fail 時、"
+            f"同じ q_attempt のまま corrective hint で再生成する最大回数 "
+            f"(default {DEFAULT_QUALITY_INNER_RETRIES}、0=従来動作、Phase 3.5)"
+        ),
+    )
     args = ap.parse_args()
 
     # --rag-adaptive-schedule を tuple[int, ...] へ parse
@@ -919,6 +1099,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.quality_inner_retries < 0:
+        print(
+            f"[ERROR] --quality-inner-retries は 0 以上必須 "
+            f"(got {args.quality_inner_retries})",
+            file=sys.stderr,
+        )
+        return 2
 
     result = distill(
         args.theme,
@@ -938,6 +1125,7 @@ def main() -> int:
         rag_max_chars=args.rag_max_chars,
         rag_adaptive=args.rag_adaptive,
         rag_schedule=rag_schedule_parsed,
+        quality_inner_retries=args.quality_inner_retries,
     )
     if not result.valid:
         print(
@@ -964,6 +1152,8 @@ def main() -> int:
     print(f"attempts: {result.attempts}/{args.max_retries}")
     if result.rag_top_k_history:
         print(f"rag_top_k: {list(result.rag_top_k_history)}")
+    if result.inner_retry_history:
+        print(f"inner_retry: {list(result.inner_retry_history)}")
     print(f"elapsed:  {result.elapsed_sec:.1f}s")
     if result.error:
         # quality_loop=True で valid=True だが品質残課題ありの warning

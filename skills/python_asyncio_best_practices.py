@@ -5,78 +5,79 @@ Source chunks: 4
 Source URLs:
 - https://dev.to/shehzan/mastering-python-async-patterns-a-complete-guide-to-asyncio-in-2026-10o6
 - https://discuss.python.org/t/asyncio-best-practices/12576
-Generated: 2026-05-31T22:05:46
+Generated: 2026-05-31T23:39:53
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helpers for working with Python asyncio following best practices.
+Helpers for working with Python's asyncio module.
 
-This module provides reusable functions to simplify common asyncio patterns,
-such as managing concurrent tasks and handling asynchronous operations.
+This module provides reusable functions for managing asynchronous tasks,
+handling HTTP clients, and processing items in batches.
 """
 
-from typing import Any, List, TypeVar
 import asyncio
+from contextlib import contextmanager
 
-T = TypeVar('T')
-
-async def gather_with_concurrency_limit(coroutines: List[T], concurrency: int = 100) -> List[T]:
-    """
-    Run multiple coroutines concurrently with a specified concurrency limit.
-
+@contextmanager
+async def async_client_context(client_cls, *args, **kwargs):
+    """Context manager for creating and handling an asynchronous client.
+    
     Args:
-        coroutines: List of coroutine objects to run.
-        concurrency: Maximum number of concurrent tasks allowed.
-
-    Returns:
-        List of results from the completed coroutines, in the same order as the input list.
+        client_cls: The class of the asynchronous client (e.g., httpx.AsyncClient)
+        *args: Positional arguments for initializing the client
+        **kwargs: Keyword arguments for initializing the client
+    
+    Yields:
+        An instance of the asynchronous client
     """
-    semaphore = asyncio.Semaphore(concurrency)
-    futures = []
-    
-    async def sem_coroutine(coro):
-        async with semaphore:
-            return await coro
-    
-    for coroutine in coroutines:
-        futures.append(sem_coroutine(coroutine))
-    
-    return await asyncio.gather(*futures)
+    async with client_cls(*args, **kwargs) as client:
+        yield client
 
-async def run_async_task(coroutine: T) -> T:
-    """
-    Run a single coroutine to completion and return its result.
-
+async def run_async_task(coro_func, *args, **kwargs):
+    """Run an asynchronous function and await its completion.
+    
     Args:
-        coroutine: The coroutine object to execute.
-
+        coro_func: The coroutine function to execute
+        *args: Positional arguments for the coroutine function
+        **kwargs: Keyword arguments for the coroutine function
+    
     Returns:
-        Result of the completed coroutine.
+        The result of the coroutine function
     """
-    loop = asyncio.get_event_loop()
-    return await coroutine
+    return await coro_func(*args, **kwargs)
 
-def create_and_run_event_loop():
+async def batch_process(items, process_func, batch_size=100):
+    """Process items in batches asynchronously.
+    
+    Args:
+        items: List of items to process
+        process_func: Async function that processes each item
+        batch_size: Number of items to process per batch
+    
+    Returns:
+        List of results from processing all items
     """
-    Utility function to create an event loop and run a single async task.
+    results = []
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i+batch_size]
+        batch_results = await asyncio.gather(
+            *[process_func(item) for item in batch]
+        )
+        results.extend(batch_results)
+        await asyncio.sleep(1)  # Rate limiting
+    return results
 
-    This is useful for running async functions in synchronous code.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-# Example usage (only if __main__):
+# Example usage (only included if necessary; not part of the main module exports):
 if __name__ == "__main__":
     import httpx
-
+    
     async def fetch_user(client, user_id):
         response = await client.get(f"https://api.example.com/users/{user_id}")
         return response.json()
-
-    users = [1, 2, 3, 4, 5]
-    tasks = [fetch_user(httpx.AsyncClient(), uid) for uid in users]
-    results = asyncio.run(gather_with_concurrency_limit(tasks))
+    
+    # Usage example:
+    # users = [1, 2, 3]
+    # results = asyncio.run(batch_process(users, lambda u: fetch_user(httpx.AsyncClient(), u)))
