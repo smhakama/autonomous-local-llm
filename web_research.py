@@ -60,6 +60,7 @@ from playwright.async_api import (
 )
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
+from cleanse_chunk import cleanse_batch
 from tenacity import (
     retry,
     retry_if_exception,
@@ -548,6 +549,14 @@ def parse_themes_file(path: str) -> list[str]:
     return themes
 
 
+def _parse_cleanse_keywords(raw: str) -> tuple[str, ...]:
+    """comma-separated string → tuple of stripped keywords (空文字で空 tuple)。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return ()
+    return tuple(k.strip() for k in raw.split(",") if k.strip())
+
+
 async def run_research(
     theme: str,
     max_pages: int,
@@ -556,6 +565,14 @@ async def run_research(
     expand_limit: int = 5,
     ask_gemini_bin: str = "ask_gemini",
     ask_gemini_timeout: int = 30,
+    cleanse: bool = False,
+    cleanse_max_chunks_per_page: int = 5,
+    cleanse_per_chunk_timeout: int = 180,
+    cleanse_filter_max_chars: int = 1500,
+    cleanse_filter_heading_keywords: tuple[str, ...] = (
+        "nav", "footer", "sidebar", "related", "menu", "breadcrumb",
+    ),
+    cleanse_collection: str = "web_brain_clean",
 ) -> int:
     print(f"=== theme: {theme!r} ===")
     print(f"=== embed model: {EMBED_MODEL} ===")
@@ -595,6 +612,7 @@ async def run_research(
         return 1
 
     total_chunks = 0
+    total_cleansed = 0
     for url in urls:
         print(f"--- fetching: {url}")
         page = await fetch_page(url)
@@ -609,11 +627,49 @@ async def run_research(
             f"chunks={len(chunks)} (upserted={n})"
         )
 
+        if cleanse and chunks:
+            chunk_payloads = [
+                {
+                    "text": c.text,
+                    "heading_path": c.heading_path,
+                    "url": page.url,
+                    "theme": theme,
+                    "chunk_idx": i,
+                }
+                for i, c in enumerate(chunks)
+            ]
+            cleanse_results = cleanse_batch(
+                chunk_payloads,
+                max_chunks=cleanse_max_chunks_per_page,
+                per_chunk_timeout=cleanse_per_chunk_timeout,
+                output_mode="new-collection",
+                filter_max_chars=cleanse_filter_max_chars,
+                filter_heading_keywords=cleanse_filter_heading_keywords,
+                clean_collection=cleanse_collection,
+                qd_client=qd,
+            )
+            n_clean = sum(
+                1 for r in cleanse_results
+                if not r.skipped and r.cleansed_text.strip()
+            )
+            total_cleansed += n_clean
+            print(f"    cleansed → {cleanse_collection}: {n_clean} chunks")
+
     info = qd.get_collection(COLLECTION)
     print(
         f"upserted total {total_chunks} chunks. "
         f"collection {COLLECTION} total points: {info.points_count}"
     )
+    if cleanse:
+        try:
+            info_clean = qd.get_collection(cleanse_collection)
+            print(
+                f"cleansed total {total_cleansed} chunks. "
+                f"collection {cleanse_collection} total points: "
+                f"{info_clean.points_count}"
+            )
+        except Exception as e:
+            print(f"[WARN] cannot stat {cleanse_collection}: {e}", file=sys.stderr)
     demo_search(qd, theme)
     return 0
 
@@ -681,6 +737,14 @@ async def amain(args: argparse.Namespace) -> int:
                         expand_limit=args.expand_limit,
                         ask_gemini_bin=args.ask_gemini_bin,
                         ask_gemini_timeout=args.ask_gemini_timeout,
+                        cleanse=args.cleanse,
+                        cleanse_max_chunks_per_page=args.cleanse_max_chunks_per_page,
+                        cleanse_per_chunk_timeout=args.cleanse_per_chunk_timeout,
+                        cleanse_filter_max_chars=args.cleanse_filter_max_chars,
+                        cleanse_filter_heading_keywords=_parse_cleanse_keywords(
+                            args.cleanse_filter_heading_keywords
+                        ),
+                        cleanse_collection=args.cleanse_collection,
                     )
                     if rc != 0:
                         failed.append(theme)
@@ -728,6 +792,14 @@ async def amain(args: argparse.Namespace) -> int:
         expand_limit=args.expand_limit,
         ask_gemini_bin=args.ask_gemini_bin,
         ask_gemini_timeout=args.ask_gemini_timeout,
+        cleanse=args.cleanse,
+        cleanse_max_chunks_per_page=args.cleanse_max_chunks_per_page,
+        cleanse_per_chunk_timeout=args.cleanse_per_chunk_timeout,
+        cleanse_filter_max_chars=args.cleanse_filter_max_chars,
+        cleanse_filter_heading_keywords=_parse_cleanse_keywords(
+            args.cleanse_filter_heading_keywords
+        ),
+        cleanse_collection=args.cleanse_collection,
     )
 
 
@@ -776,6 +848,34 @@ def main() -> int:
     ap.add_argument(
         "--ask-gemini-timeout", type=int, default=30,
         help="ask_gemini 呼出 timeout 秒 (default 30)",
+    )
+    ap.add_argument(
+        "--cleanse", action="store_true",
+        help=(
+            "page 取得後に cleanse_batch → web_brain_clean 投入 "
+            "(Phase 2.5b2、default OFF)"
+        ),
+    )
+    ap.add_argument(
+        "--cleanse-max-chunks-per-page", type=int, default=5,
+        help="--cleanse 時、1 page あたりの cleanse 最大 chunk 数 (default 5)",
+    )
+    ap.add_argument(
+        "--cleanse-per-chunk-timeout", type=int, default=180,
+        help="--cleanse の per-chunk timeout 秒 (default 180)",
+    )
+    ap.add_argument(
+        "--cleanse-filter-max-chars", type=int, default=1500,
+        help="--cleanse の filter: 短い chunk のみ採択 (default 1500、0 で無効)",
+    )
+    ap.add_argument(
+        "--cleanse-filter-heading-keywords",
+        default="nav,footer,sidebar,related,menu,breadcrumb",
+        help="--cleanse の filter: comma-separated heading keywords",
+    )
+    ap.add_argument(
+        "--cleanse-collection", default="web_brain_clean",
+        help="cleanse 結果を投入する Qdrant collection (default web_brain_clean)",
     )
     args = ap.parse_args()
     return asyncio.run(amain(args))

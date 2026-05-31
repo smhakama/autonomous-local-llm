@@ -21,18 +21,27 @@ PoC スコープ:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 QDRANT_HOST = "127.0.0.1"
@@ -209,6 +218,65 @@ def _write_sidecar(results: list[CleanseResult], path: str) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+DEFAULT_CLEAN_COLLECTION = "web_brain_clean"
+CLEAN_VEC_DIM = 1024  # bge-m3 dim
+
+
+def _upsert_to_clean_collection(
+    qd: QdrantClient,
+    results: list[CleanseResult],
+    *,
+    collection: str = DEFAULT_CLEAN_COLLECTION,
+    vec_dim: int = CLEAN_VEC_DIM,
+) -> int:
+    """cleanse 結果を別 collection に upsert (元 collection は無変更)。
+
+    point ID = sha1("clean::" + chunk_id + "::" + batch_id) → UUID で決定論的。
+    payload に source_chunk_id / cosine_with_original / 元/cleansed chars を保存
+    することで追跡可能性 + 品質メトリクスを残す。
+    """
+    if not qd.collection_exists(collection):
+        qd.create_collection(
+            collection,
+            vectors_config=VectorParams(size=vec_dim, distance=Distance.COSINE),
+        )
+        print(f"created clean collection: {collection} (dim={vec_dim})")
+
+    points: list[PointStruct] = []
+    for r in results:
+        if r.skipped or not r.cleansed_text.strip():
+            continue
+        try:
+            vec = embed(r.cleansed_text)
+        except requests.exceptions.RequestException as e:
+            print(f"  [WARN] embed for upsert failed: {e}", file=sys.stderr)
+            continue
+        h = hashlib.sha1(
+            f"clean::{r.chunk_id}::{r.batch_id}".encode("utf-8")
+        ).hexdigest()
+        pid = str(uuid.UUID(hex=h[:32]))
+        points.append(
+            PointStruct(
+                id=pid,
+                vector=vec,
+                payload={
+                    "batch_id": r.batch_id,
+                    "source_chunk_id": r.chunk_id,
+                    "theme": r.theme,
+                    "url": r.url,
+                    "heading_path": r.heading_path,
+                    "original_chars": r.original_chars,
+                    "cleansed_chars": r.cleansed_chars,
+                    "cosine_with_original": r.cosine,
+                    "text": r.cleansed_text,
+                },
+            )
+        )
+    if points:
+        qd.upsert(collection, points=points)
+    return len(points)
+
+
 def cleanse_batch(
     chunks: list[dict],
     *,
@@ -220,6 +288,8 @@ def cleanse_batch(
     batch_id: str | None = None,
     filter_max_chars: int = DEFAULT_FILTER_MAX_CHARS,
     filter_heading_keywords: tuple[str, ...] = DEFAULT_FILTER_HEADING_KEYWORDS,
+    clean_collection: str = DEFAULT_CLEAN_COLLECTION,
+    qd_client: QdrantClient | None = None,
 ) -> list[CleanseResult]:
     """セーフティネット込みのバッチ cleanse。
 
@@ -340,13 +410,18 @@ def cleanse_batch(
         _write_sidecar(results, path)
         print(f"\nsidecar written: {path} ({len(results)} lines)")
     elif output_mode == "new-collection":
+        qd = qd_client or QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        n = _upsert_to_clean_collection(
+            qd, results, collection=clean_collection,
+        )
         print(
-            "[WARN] output-mode 'new-collection' is Phase 2.5b2 scope (no Qdrant write)",
-            file=sys.stderr,
+            f"\nupserted to clean collection '{clean_collection}': "
+            f"{n} points ({len(results) - n} skipped/empty)"
         )
     elif output_mode == "update-payload":
         print(
-            "[WARN] output-mode 'update-payload' is Phase 2.5b2 scope (no Qdrant write)",
+            "[WARN] output-mode 'update-payload' is not yet implemented "
+            "(future phase)",
             file=sys.stderr,
         )
     # preview mode は保存なし (caller 側で目視表示)
@@ -412,6 +487,13 @@ def main() -> int:
         "--preview-chars", type=int, default=1500,
         help="preview mode 時の表示文字数 (default 1500)",
     )
+    ap.add_argument(
+        "--clean-collection", default=DEFAULT_CLEAN_COLLECTION,
+        help=(
+            f"output-mode=new-collection 時の投入先 collection "
+            f"(default {DEFAULT_CLEAN_COLLECTION})"
+        ),
+    )
     args = ap.parse_args()
 
     raw_kw = (args.filter_heading_keywords or "").strip()
@@ -442,6 +524,8 @@ def main() -> int:
         batch_id=args.batch_id,
         filter_max_chars=args.filter_max_chars,
         filter_heading_keywords=keywords,
+        clean_collection=args.clean_collection,
+        qd_client=qd,
     )
 
     # preview mode: 元/cleansed の並列表示 (PoC 互換)
