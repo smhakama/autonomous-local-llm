@@ -31,3 +31,6 @@ Thumbs.db
 # Qdrant / model data should not live in the repo
 qdrant_storage/
 ollama_models/
+
+# Phase 2.5b1 cleanse output (sidecar JSONL は手元評価専用、git 管理対象外)
+cleanse_output/
