@@ -55,6 +55,11 @@ DEFAULT_RAG_TOP_K = 2  # 注入する追加 chunks 数 (prompt 増大による 1
 DEFAULT_RAG_MAX_CHARS = 1000  # 各 RAG chunk の最大文字数 (truncate 後 ...)
 RAG_EMBED_MODEL = "bge-m3"
 
+# --- Phase 3.4 adaptive RAG 定数 ---
+# schedule[q_attempt] = その q_attempt で注入する RAG top_k 数。0 = RAG OFF。
+# default = "0→2→3" (初回 OFF → quality FAIL なら top_k=2 → さらに FAIL なら top_k=3)
+DEFAULT_RAG_ADAPTIVE_SCHEDULE: tuple[int, ...] = (0, 2, 3)
+
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
 Output EXACTLY one line per callable, format:
@@ -125,6 +130,7 @@ class DistillResult:
     skill_path: Path | None
     elapsed_sec: float
     attempts: int
+    rag_top_k_history: tuple[int, ...] = ()
 
 
 def fetch_chunks_by_theme(
@@ -494,11 +500,25 @@ def distill(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     rag_collection: str = DEFAULT_RAG_COLLECTION,
     rag_max_chars: int = DEFAULT_RAG_MAX_CHARS,
+    rag_adaptive: bool = False,
+    rag_schedule: tuple[int, ...] = DEFAULT_RAG_ADAPTIVE_SCHEDULE,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
     verify=False のとき L1 のみ検査して即返却 (legacy --no-verify 用)。
+
+    rag_adaptive=True のとき (Phase 3.4):
+        rag_schedule[q_attempt] が各 quality retry で注入する RAG top_k を決める。
+        schedule[0]=0 で初回 RAG OFF → quality_check FAIL なら schedule[1] 個注入 → さらに
+        FAIL なら schedule[2] 個注入...という adaptive 戦略。Kubernetes 型ケース
+        (RAG 自体が逆効果) を初回 PASS で救済する目的。rag_augmented とは排他。
     """
+    if rag_augmented and rag_adaptive:
+        raise ValueError(
+            "rag_augmented と rag_adaptive は排他。どちらか片方のみ指定可。"
+        )
+    if rag_adaptive and not rag_schedule:
+        raise ValueError("rag_adaptive=True のとき rag_schedule は非空必須")
     qd = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     chunks = fetch_chunks_by_theme(qd, collection, theme)
     if not chunks:
@@ -516,6 +536,7 @@ def distill(
         print(f"        - {u}")
 
     rag_chunks: list[dict] = []
+    rag_top_k_history: list[int] = []
     if rag_augmented:
         rag_chunks = retrieve_rag_chunks(
             qd, theme,
@@ -528,6 +549,29 @@ def distill(
         )
         for u in rag_urls:
             print(f"        + {u}")
+        rag_top_k_history.append(len(rag_chunks))
+    elif rag_adaptive:
+        initial_top_k = rag_schedule[0]
+        if initial_top_k > 0:
+            rag_chunks = retrieve_rag_chunks(
+                qd, theme,
+                collection=rag_collection, top_k=initial_top_k,
+                max_chars=rag_max_chars,
+            )
+            rag_urls = sorted({c.get("url", "") for c in rag_chunks if c.get("url")})
+            print(
+                f"      [RAG-adaptive] initial top_k={initial_top_k}: "
+                f"retrieved {len(rag_chunks)} chunks from {rag_collection} "
+                f"({len(rag_urls)} unique URLs)"
+            )
+            for u in rag_urls:
+                print(f"        + {u}")
+        else:
+            print(
+                f"      [RAG-adaptive] schedule={list(rag_schedule)}, "
+                f"initial top_k=0 (RAG OFF for first attempt)"
+            )
+        rag_top_k_history.append(initial_top_k)
 
     prompt = build_distillation_prompt(theme, chunks, rag_chunks=rag_chunks)
     print(f"[2/3] prompt size: {len(prompt)} chars")
@@ -580,6 +624,7 @@ def distill(
                 theme=theme, n_chunks=len(chunks), source_urls=source_urls,
                 raw_response=raw, extracted_code=code, valid=True, error=None,
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
+                rag_top_k_history=tuple(rag_top_k_history),
             )
 
         # L2: import 検証 (ファイルを実 path に書いて subprocess import)
@@ -614,6 +659,7 @@ def distill(
                 theme=theme, n_chunks=len(chunks), source_urls=source_urls,
                 raw_response=raw, extracted_code=code, valid=True, error=None,
                 skill_path=path, elapsed_sec=elapsed, attempts=attempt,
+                rag_top_k_history=tuple(rag_top_k_history),
             )
 
         # Phase 3.2 quality loop: L4 (mypy) + L5 (Gemini) を最大 quality_max_retries 回
@@ -642,6 +688,7 @@ def distill(
                     theme=theme, n_chunks=len(chunks), source_urls=source_urls,
                     raw_response=raw, extracted_code=code, valid=True, error=None,
                     skill_path=path, elapsed_sec=elapsed, attempts=attempt,
+                    rag_top_k_history=tuple(rag_top_k_history),
                 )
             final_feedback = feedback
             if q_attempt >= quality_max_retries:
@@ -651,6 +698,37 @@ def distill(
                 f"      [L4+L5] quality retry {q_attempt}/{quality_max_retries}: "
                 f"re-distilling with feedback"
             )
+            # Phase 3.4: adaptive モード時、schedule[q_attempt] に従い RAG を再注入
+            if rag_adaptive and q_attempt < len(rag_schedule):
+                new_top_k = rag_schedule[q_attempt]
+                if new_top_k > 0:
+                    adapt_rag_chunks = retrieve_rag_chunks(
+                        qd, theme,
+                        collection=rag_collection,
+                        top_k=new_top_k, max_chars=rag_max_chars,
+                    )
+                    adapt_urls = sorted(
+                        {c.get("url", "") for c in adapt_rag_chunks if c.get("url")}
+                    )
+                    print(
+                        f"      [RAG-adaptive] retry {q_attempt}: top_k={new_top_k} "
+                        f"→ {len(adapt_rag_chunks)} chunks "
+                        f"({len(adapt_urls)} unique URLs)"
+                    )
+                    for u in adapt_urls:
+                        print(f"        + {u}")
+                else:
+                    adapt_rag_chunks = []
+                    print(
+                        f"      [RAG-adaptive] retry {q_attempt}: "
+                        f"top_k=0 (RAG OFF)"
+                    )
+                rag_top_k_history.append(new_top_k)
+                # base prompt を schedule の RAG 強度で再構築
+                prompt = build_distillation_prompt(
+                    theme, chunks, rag_chunks=adapt_rag_chunks,
+                )
+                print(f"      [RAG-adaptive] prompt size: {len(prompt)} chars")
             q_prompt = prompt + (
                 f"\n\nQUALITY ISSUES FROM PREVIOUS GENERATION:\n{feedback}\n\n"
                 f"Regenerate the entire module fixing these specific issues. "
@@ -718,6 +796,7 @@ def distill(
             raw_response=raw, extracted_code=code, valid=True,
             error=f"quality issues remained: {final_feedback[:300]}",
             skill_path=path, elapsed_sec=elapsed, attempts=attempt,
+            rag_top_k_history=tuple(rag_top_k_history),
         )
 
     elapsed = time.time() - t0
@@ -725,6 +804,7 @@ def distill(
         theme=theme, n_chunks=len(chunks), source_urls=source_urls,
         raw_response=raw, extracted_code=code, valid=False, error=last_err,
         skill_path=None, elapsed_sec=elapsed, attempts=attempts,
+        rag_top_k_history=tuple(rag_top_k_history),
     )
 
 
@@ -794,7 +874,51 @@ def main() -> int:
             "prompt 肥大化抑制、0 で無効)"
         ),
     )
+    # --- Phase 3.4 adaptive RAG 引数 ---
+    ap.add_argument(
+        "--rag-adaptive", action="store_true",
+        help=(
+            "適応的 RAG: 初回 RAG OFF → quality_check FAIL のとき "
+            "schedule に従って RAG 強度を段階的に上げる (Phase 3.4)。"
+            "--rag-augmented と排他。--quality-loop 併用前提。"
+        ),
+    )
+    ap.add_argument(
+        "--rag-adaptive-schedule",
+        default=",".join(str(n) for n in DEFAULT_RAG_ADAPTIVE_SCHEDULE),
+        help=(
+            f"adaptive top_k schedule カンマ区切り "
+            f"(default {','.join(str(n) for n in DEFAULT_RAG_ADAPTIVE_SCHEDULE)!r})。"
+            "schedule[q_attempt] = その retry での top_k、0 = RAG OFF。"
+        ),
+    )
     args = ap.parse_args()
+
+    # --rag-adaptive-schedule を tuple[int, ...] へ parse
+    try:
+        rag_schedule_parsed: tuple[int, ...] = tuple(
+            int(x.strip()) for x in args.rag_adaptive_schedule.split(",")
+            if x.strip()
+        )
+    except ValueError as e:
+        print(
+            f"[ERROR] --rag-adaptive-schedule parse 失敗: {e} "
+            f"(value={args.rag_adaptive_schedule!r}、カンマ区切り int を期待)",
+            file=sys.stderr,
+        )
+        return 2
+    if args.rag_adaptive and not rag_schedule_parsed:
+        print(
+            "[ERROR] --rag-adaptive-schedule が空、最低 1 つの int 必須",
+            file=sys.stderr,
+        )
+        return 2
+    if any(n < 0 for n in rag_schedule_parsed):
+        print(
+            f"[ERROR] --rag-adaptive-schedule に負値: {rag_schedule_parsed}",
+            file=sys.stderr,
+        )
+        return 2
 
     result = distill(
         args.theme,
@@ -812,6 +936,8 @@ def main() -> int:
         rag_top_k=args.rag_top_k,
         rag_collection=args.rag_collection,
         rag_max_chars=args.rag_max_chars,
+        rag_adaptive=args.rag_adaptive,
+        rag_schedule=rag_schedule_parsed,
     )
     if not result.valid:
         print(
@@ -836,6 +962,8 @@ def main() -> int:
     )
     print(f"callables: {callables}")
     print(f"attempts: {result.attempts}/{args.max_retries}")
+    if result.rag_top_k_history:
+        print(f"rag_top_k: {list(result.rag_top_k_history)}")
     print(f"elapsed:  {result.elapsed_sec:.1f}s")
     if result.error:
         # quality_loop=True で valid=True だが品質残課題ありの warning

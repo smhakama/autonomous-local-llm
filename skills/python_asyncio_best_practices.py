@@ -5,126 +5,78 @@ Source chunks: 4
 Source URLs:
 - https://dev.to/shehzan/mastering-python-async-patterns-a-complete-guide-to-asyncio-in-2026-10o6
 - https://discuss.python.org/t/asyncio-best-practices/12576
-Generated: 2026-05-31T20:47:27
+Generated: 2026-05-31T22:05:46
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helper functions for working with Python's asyncio module following best practices.
+Helpers for working with Python asyncio following best practices.
 
-This module provides reusable patterns for common asynchronous operations,
-including task management, concurrency control, and error handling.
+This module provides reusable functions to simplify common asyncio patterns,
+such as managing concurrent tasks and handling asynchronous operations.
 """
 
+from typing import Any, List, TypeVar
 import asyncio
-import logging
-from typing import Any, Optional, List, Iterable, Callable, Coroutine
 
-logger = logging.getLogger(__name__)
+T = TypeVar('T')
 
-async def async_run_with_timeout(coro: Coroutine, timeout: float) -> tuple[bool, Optional[Any]]:
+async def gather_with_concurrency_limit(coroutines: List[T], concurrency: int = 100) -> List[T]:
     """
-    Run a coroutine with a specified timeout, returning whether it completed successfully.
-    
+    Run multiple coroutines concurrently with a specified concurrency limit.
+
     Args:
-        coro: The coroutine to run
-        timeout: Maximum allowed time in seconds
-        
-    Returns:
-        Tuple of (success: bool, result_or_error: Optional[Any])
-    """
-    try:
-        return (True, await asyncio.wait_for(coro, timeout))
-    except asyncio.TimeoutError:
-        logger.warning(f"Coroutine {coro.__name__} timed out after {timeout}s")
-        return (False, "Timeout occurred")
-    except Exception as e:
-        logger.error(f"Coroutine {coro.__name__} failed: {e}")
-        return (False, str(e))
+        coroutines: List of coroutine objects to run.
+        concurrency: Maximum number of concurrent tasks allowed.
 
-def gather_with_limits(coroutines: Iterable[Coroutine], max_concurrent: int = 10) -> asyncio.Future:
-    """
-    Run multiple coroutines concurrently with concurrency limits using a semaphore.
-    
-    Args:
-        coroutines: Iterable of coroutine objects
-        max_concurrent: Maximum number of concurrent tasks
-        
     Returns:
-        Future representing the gathering operation
+        List of results from the completed coroutines, in the same order as the input list.
     """
-    semaphore = asyncio.Semaphore(max_concurrent)
-    async def run_coroutine(coro):
+    semaphore = asyncio.Semaphore(concurrency)
+    futures = []
+    
+    async def sem_coroutine(coro):
         async with semaphore:
             return await coro
-    return asyncio.gather(*[run_coroutine(c) for c in coroutines])
-
-def create_task_with_exception_handling(
-    coro: Coroutine, 
-    on_error: Optional[Callable[[Exception], None]] = None
-) -> asyncio.Task:
-    """
-    Create a task with proper exception handling and logging.
     
-    Args:
-        coro: The coroutine to run as a task
-        on_error: Callback for handling exceptions (optional)
-        
-    Returns:
-        The created Task object
-    """
-    def error_handler(task: asyncio.Task):
-        exc = task.exception()
-        if exc is not None:
-            logger.error(f"Task {task} failed: {exc}")
-            if on_error is not None:
-                on_error(exc)
-    task = asyncio.create_task(coro)
-    task.add_done_callback(error_handler)
-    return task
-
-async def run_blocking_functions_in_loop(
-    functions: List[Callable], 
-    loop: Optional[asyncio.AbstractEventLoop] = None
-) -> List[Any]:
-    """
-    Run synchronous blocking functions in an async event loop without blocking.
+    for coroutine in coroutines:
+        futures.append(sem_coroutine(coroutine))
     
-    Args:
-        functions: List of synchronous callables to execute
-        loop: Event loop to use (optional, default is current)
-        
-    Returns:
-        List of results from the function calls
-    """
-    if loop is None:
-        loop = asyncio.get_event_loop()
-    tasks = []
-    for func in functions:
-        async def wrapper(f):
-            return await loop.run_in_executor(None, f)
-        tasks.append(wrapper(func))
-    return await asyncio.gather(*tasks)
+    return await asyncio.gather(*futures)
 
-def measure_async_task_duration(coro: Coroutine) -> Callable:
+async def run_async_task(coroutine: T) -> T:
     """
-    Decorator to measure the duration of an async task.
-    
-    Args:
-        coro: The coroutine to wrap
-        
-    Returns:
-        Wrapped coroutine with timing measurements
-    """
-    async def timed_coroutine():
-        start = asyncio.get_event_loop().time()
-        result = await coro
-        duration = asyncio.get_event_loop().time() - start
-        logger.info(f"{coro.__name__} completed in {duration:.2f}s")
-        return result
-    return timed_coroutine
+    Run a single coroutine to completion and return its result.
 
+    Args:
+        coroutine: The coroutine object to execute.
+
+    Returns:
+        Result of the completed coroutine.
+    """
+    loop = asyncio.get_event_loop()
+    return await coroutine
+
+def create_and_run_event_loop():
+    """
+    Utility function to create an event loop and run a single async task.
+
+    This is useful for running async functions in synchronous code.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+# Example usage (only if __main__):
 if __name__ == "__main__":
-    pass  # Example usage can go here if needed
+    import httpx
+
+    async def fetch_user(client, user_id):
+        response = await client.get(f"https://api.example.com/users/{user_id}")
+        return response.json()
+
+    users = [1, 2, 3, 4, 5]
+    tasks = [fetch_user(httpx.AsyncClient(), uid) for uid in users]
+    results = asyncio.run(gather_with_concurrency_limit(tasks))

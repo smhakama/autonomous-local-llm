@@ -4,101 +4,61 @@ Theme: Kubernetes pod security standards
 Source chunks: 1
 Source URLs:
 - https://kubernetes.io/docs/concepts/security/pod-security-standards/
-Generated: 2026-05-31T21:08:49
+Generated: 2026-05-31T21:59:26
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helper module for validating Kubernetes pod security configurations based on standards.
-
-This module provides functions to validate seccomp profiles and sysctl settings,
-ensuring they meet Kubernetes Pod Security Standards requirements.
+This module provides helper functions for validating Kubernetes pod security standards related to seccomp profiles and sysctls.
 """
 
-from typing import List, Optional, Set
+from typing import Optional, Literal, Union
 
+SECCOMP_PROFILE_TYPES: tuple[Literal['RuntimeDefault', 'Localhost', None], ...] = (
+    'RuntimeDefault',
+    'Localhost',
+    None,
+)
 
-ALLOWED_SECCOMP_PROFILES: List[str] = ["RuntimeDefault", "Localhost"]
-"""Allowed Seccomp profile types according to Kubernetes standards."""
+def is_valid_seccomp_profile_type(seccomp_type: Optional[str]) -> bool:
+    """
+    Determines if a seccomp profile type is valid according to Kubernetes standards.
 
-ALLOWED_SYCTLS: Set[str] = {
+    Args:
+        seccomp_type (Optional[str]): The seccomp profile type to validate.
+            Allowed values are 'RuntimeDefault', 'Localhost', or None.
+
+    Returns:
+        bool: True if the value is valid, False otherwise.
+    """
+    return seccomp_type in SECCOMP_PROFILE_TYPES
+
+ALLOWED_SYSCtls = {
     "kernel.shm_rmid_forced",
     "net.ipv4.ip_local_port_range",
     "net.ipv4.ip_unprivileged_port_start",
     "net.ipv4.tcp_syncookies",
     "net.ipv4.ping_group_range",
-    "net.ipv4.ip_local_reserved_ports",  # since Kubernetes 1.27
-    "net.ipv4.tcp_keepalive_time",       # since Kubernetes 1.29
+    "net.ipv4.ip_local_reserved_ports",
+    "net.ipv4.tcp_keepalive_time",
     "net.ipv4.tcp_fin_timeout",
     "net.ipv4.tcp_keepalive_intvl",
     "net.ipv4.tcp_keepalive_probes",
 }
-"""Set of allowed sysctl names according to Kubernetes standards."""
 
-
-def is_seccomp_profile_valid(profile: Optional[str]) -> bool:
-    """Check if a given seccomp profile type is allowed.
+def is_allowed_sysctl(sysctl_name: str) -> bool:
+    """
+    Checks if a sysctl name is allowed by Kubernetes pod security standards.
 
     Args:
-        profile: The seccomp profile type to check, can be None or a string.
-    
+        sysctl_name (str): The sysctl parameter to validate.
+
     Returns:
-        True if the profile is allowed, False otherwise.
+        bool: True if the sysctl is allowed, False otherwise.
     """
-    return profile in ALLOWED_SECCOMP_PROFILES
+    return sysctl_name in ALLOWED_SYSCtls
 
-
-def are_sysctl_names_allowed(sysctl_names: List[str]) -> bool:
-    """Validate that all sysctl names are within the allowed set.
-
-    Args:
-        sysctl_names: List of sysctl names to validate.
-    
-    Returns:
-        True if all names are allowed, False otherwise.
-    """
-    return all(name in ALLOWED_SYCTLS for name in sysctl_names)
-
-
-def validate_pod_security_profile(pod_config):
-    """Validate that pod security profile meets Kubernetes standards.
-
-    Args:
-        pod_config: The pod configuration to validate.
-    
-    Returns:
-        None if valid, raises ValueError otherwise.
-    """
-    # Check seccomp profiles across all containers
-    for container_type in ["containers", "initContainers", "ephemeralContainers"]:
-        containers = getattr(pod_config.spec.securityContext, container_type)
-        for container in containers:
-            profile = container.securityContext.seccompProfile.type
-            if not is_seccomp_profile_valid(profile):
-                raise ValueError(f"Invalid seccomp profile type: {profile}")
-
-    # Validate sysctls
-    if pod_config.sysctls:
-        if not are_sysctl_names_allowed(pod_config.sysctls.name):
-            raise ValueError("Sysctl names must be within allowed set")
-
-
-def validate_container_security_context(container_config):
-    """Validate a single container's security context.
-
-    Args:
-        container_config: The container configuration to validate.
-    
-    Returns:
-        None if valid, raises ValueError otherwise.
-    """
-    profile = container_config.securityContext.seccompProfile.type
-    if not is_seccomp_profile_valid(profile):
-        raise ValueError(f"Invalid seccomp profile type: {profile}")
-
-    # Validate sysctls for the container
-    if container_config.sysctls:
-        if not are_sysctl_names_allowed(container_config.sysctls.name):
-            raise ValueError("Sysctl names must be within allowed set")
+if __name__ == "__main__":
+    pass  # Example usage can go here if needed
