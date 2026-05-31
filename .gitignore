@@ -34,3 +34,7 @@ ollama_models/
 
 # Phase 2.5b1 cleanse output (sidecar JSONL は手元評価専用、git 管理対象外)
 cleanse_output/
+
+# Phase 3.7 metrics — run-by-run JSONL append (per-host history)
+# 再現性は record 内の git_commit field で担保するため git 管理しない
+metrics/

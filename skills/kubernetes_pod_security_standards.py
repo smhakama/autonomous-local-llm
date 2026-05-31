@@ -4,85 +4,46 @@ Theme: Kubernetes pod security standards
 Source chunks: 1
 Source URLs:
 - https://kubernetes.io/docs/concepts/security/pod-security-standards/
-Generated: 2026-06-01T01:20:22
+Generated: 2026-06-01T01:45:28
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Kubernetes Pod Security Standards Helper Functions
-This module provides reusable functions to validate pod security configurations against Kubernetes' Pod Security Standards (PSS).
+Kubernetes Pod Security Standards Helper Module
+
+This module provides utility functions to validate pod security configurations 
+against Kubernetes' recommended standards.
 """
 
-from typing import Optional, Dict, List
+def get_seccomp_profile_types():
+    """Return the allowed seccomp profile types for pods.
 
-# Type aliases
-SecurityContext = Dict[str, Optional[str]]
-PodSpec = Dict[str, Dict[str, List[SecurityContext]]]
-
-def is_valid_seccomp_profile(seccomp_type: str) -> bool:
-    """
-    Check if a seccomp profile type is allowed by Kubernetes PSS.
-    
-    Args:
-        seccomp_type (str): Type of seccomp profile to check
-        
     Returns:
-        bool: True if valid, False otherwise
+        list: A list of valid seccomp profile type strings
     """
-    return seccomp_type in {'RuntimeDefault', 'Localhost'}
+    return ['RuntimeDefault', 'Localhost']
 
-def _get_allowed_sysctls() -> List[str]:
-    """
-    Return the list of allowed sysctl names per Kubernetes PSS.
-    
+def get_allowed_sysctls():
+    """Return the allowed sysctl names and their minimum Kubernetes versions.
+
     Returns:
-        List[str]: Allowed sysctl names
+        dict: Mapping from sysctl name to version string indicating when it was 
+            first allowed
     """
-    return [
-        'kernel.shm_rmid_forced',
-        'net.ipv4.ip_local_port_range',
-        'net.ipv4.ip_unprivileged_port_start',
-        'net.ipv4.tcp_syncookies',
-        'net.ipv4.ping_group_range',
-        'net.ipv4.ip_local_reserved_ports',  # since Kubernetes 1.27
-        'net.ipv4.tcp_keepalive_time',       # since Kubernetes 1.29
-        'net.ipv4.tcp_fin_timeout',
-        'net.ipv4.tcp_keepalive_intvl',
-        'net.ipv4.tcp_keepalive_probes'
-    ]
+    return {
+        "kernel.shm_rmid_forced": None,
+        "net.ipv4.ip_local_port_range": None,
+        "net.ipv4.ip_unprivileged_port_start": None,
+        "net.ipv4.tcp_syncookies": None,
+        "net.ipv4.ping_group_range": None,
+        "net.ipv4.ip_local_reserved_ports": "1.27",
+        "net.ipv4.tcp_keepalive_time": "1.29",
+        "net.ipv4.tcp_fin_timeout": "1.29",
+        "net.ipv4.tcp_keepalive_intvl": "1.29",
+        "net.ipv4.tcp_keepalive_probes": "1.29"
+    }
 
-def validate_seccomp_and_sysctls(pod_spec: PodSpec) -> bool:
-    """
-    Validate pod security configuration against Kubernetes PSS for seccomp and sysctls.
-    
-    Args:
-        pod_spec (PodSpec): Dictionary representing the pod specification
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    allowed_sysctls = _get_allowed_sysctls()
-    
-    def check_container_security(containers_path: str) -> None:
-        containers = pod_spec.get('containers', [])
-        for container in containers[containers_path]:
-            sc = container['securityContext']
-            
-            # Check seccomp profile
-            if not is_valid_seccomp_profile(sc.get('seccompProfile', {}).get('type', '')):
-                raise ValueError("Invalid seccomp profile type")
-            
-            # Check sysctls
-            for sysctl in sc.get('sysctls', []):
-                if sysctl['name'] not in allowed_sysctls:
-                    raise ValueError(f"Disallowed sysctl: {sysctl['name']}")
-    
-    try:
-        check_container_security("[*]")
-        return True
-    except (KeyError, ValueError) as e:
-        return False
-
-__all__ = ['is_valid_seccomp_profile', 'validate_seccomp_and_sysctls']
+if __name__ == "__main__":
+    pass  # Example usage can be placed here if needed

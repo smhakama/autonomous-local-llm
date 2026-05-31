@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import dataclasses
+import json
 import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -561,6 +563,95 @@ def gemini_review(
     return True, parse_gemini_review(proc.stdout)
 
 
+# --- Phase 3.7 metrics JSONL writer ---
+# 各 distill() 実行の結果と config snapshot を 1 行 JSONL で追記し、run-to-run
+# 変動や model × theme × schedule の比較を後段で集計可能にする。
+# raw_response / extracted_code は冗長 (skill_path から物理ファイル復元可) のため
+# JSONL では除外し、ファイル肥大化を抑制する。schema 進化は schema_version で管理。
+
+METRICS_SCHEMA_VERSION = 1
+
+
+def _safe_git_rev() -> str | None:
+    """git rev-parse HEAD を安全に取得。git 未インストール / 非 git dir / timeout
+    すべて None で吸収。"""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
+def _safe_hostname() -> str | None:
+    try:
+        import socket
+        return socket.gethostname()
+    except OSError:
+        return None
+
+
+def _build_metrics_record(
+    result: "DistillResult",
+    args: argparse.Namespace,
+    started_at: str,
+) -> dict:
+    """DistillResult + CLI config snapshot + 環境メタを 1 dict にまとめる。
+    Path は str 化、tuple は list 化 (json.dumps 互換)。"""
+    d = dataclasses.asdict(result)
+    # 重複かつ大きいフィールドを drop
+    d.pop("raw_response", None)
+    d.pop("extracted_code", None)
+    # Path → str
+    if d.get("skill_path") is not None:
+        d["skill_path"] = str(d["skill_path"])
+    # CLI config snapshot — 再現性に効く knob のみ抜粋
+    d["config"] = {
+        "primary_model": args.model,  # dest=model (--primary-model alias)
+        "fallback_model": args.fallback_model,
+        "enable_fallback": args.enable_7b_fallback,
+        "quality_loop": args.quality_loop,
+        "quality_max_retries": args.quality_max_retries,
+        "quality_inner_retries": args.quality_inner_retries,
+        "rag_augmented": args.rag_augmented,
+        "rag_adaptive": args.rag_adaptive,
+        "rag_top_k": args.rag_top_k,
+        "rag_max_chars": args.rag_max_chars,
+        "rag_adaptive_schedule": args.rag_adaptive_schedule,
+        "collection": args.collection,
+        "max_retries": args.max_retries,
+        "timeout": args.timeout,
+    }
+    # 環境メタ
+    d["meta"] = {
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _safe_git_rev(),
+        "host": _safe_hostname(),
+        "schema_version": METRICS_SCHEMA_VERSION,
+    }
+    return d
+
+
+def _append_metrics_jsonl(path: Path, record: dict) -> bool:
+    """1 行 JSONL を append。親 directory が無ければ作成。
+    エラーは warn のみで main 処理を阻害しない。成功時 True を返す。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError as e:
+        print(
+            f"[WARN] metrics 書出し失敗 ({path}): {e}、distill 結果は正常",
+            file=sys.stderr,
+        )
+        return False
+
+
 def quality_check(
     skill_path: Path,
     *,
@@ -1042,6 +1133,8 @@ def distill(
 
 
 def main() -> int:
+    # Phase 3.7: 実行開始時刻 (UTC ISO 8601)、metrics JSONL の started_at field 用
+    started_at = datetime.now(timezone.utc).isoformat()
     ap = argparse.ArgumentParser(
         description=(
             "Phase 3 Corpus2Skill PoC: web_brain_clean からテーマ別 chunks を "
@@ -1162,6 +1255,19 @@ def main() -> int:
             f"(default {DEFAULT_FALLBACK_MODEL!r}、MODEL_REGISTRY 参照)"
         ),
     )
+    # --- Phase 3.7 metrics JSONL 引数 ---
+    ap.add_argument(
+        "--metrics-file", default="metrics/distill_runs.jsonl",
+        help=(
+            "distill 結果を 1 行 JSONL で append するパス "
+            "(default 'metrics/distill_runs.jsonl'、Phase 3.7)。"
+            "raw_response / extracted_code は除外、skill_path から物理復元可。"
+        ),
+    )
+    ap.add_argument(
+        "--no-metrics", action="store_true",
+        help="metrics JSONL 書出しを skip (Phase 3.7)",
+    )
     args = ap.parse_args()
 
     # --list-models: registry を表示して即 exit (Phase 3.6)
@@ -1235,6 +1341,14 @@ def main() -> int:
         enable_fallback=args.enable_7b_fallback,
         fallback_model=args.fallback_model,
     )
+
+    # Phase 3.7: metrics JSONL 書出し (成功/失敗どちらも記録、--no-metrics で無効化)。
+    # distillation の成功手前で書くことで、後段の return 1 / 0 どちらの path でも記録される。
+    if not args.no_metrics:
+        record = _build_metrics_record(result, args, started_at)
+        if _append_metrics_jsonl(Path(args.metrics_file), record):
+            print(f"metrics:  appended to {args.metrics_file}", file=sys.stderr)
+
     if not result.valid:
         print(
             f"\n[FAIL] distillation failed after {result.attempts} attempts: "
