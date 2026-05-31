@@ -4,47 +4,50 @@ Theme: FastAPI dependency injection patterns
 Source chunks: 3
 Source URLs:
 - https://fastapi.tiangolo.com/tutorial/dependencies/
-Generated: 2026-05-31T19:40:35
+Generated: 2026-05-31T20:58:04
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Helper functions for FastAPI dependency injection patterns.
+Helper module for FastAPI dependency injection patterns.
 
-This module provides utilities to simplify working with dependencies in FastAPI,
-especially around creating reusable and annotated dependencies.
+This module provides reusable functions and type aliases for common dependency injection patterns in FastAPI.
 """
 
-from typing import Annotated
+from typing import Annotated, Any, Optional, Union
 from fastapi import Depends
 
 
-def create_shared_dependency(func: callable) -> type:
-    """
-    Creates a shared dependency from an async function.
+async def common_parameters(
+    q: str | None = None, 
+    skip: int = 0, 
+    limit: int = 100
+) -> dict:
+    """Common query parameters for multiple endpoints.
 
     Args:
-        func: The async dependency function.
+        q: Search term or filter.
+        skip: Number of items to skip.
+        limit: Maximum number of items to return.
 
     Returns:
-        Type alias for the dependency with Annotated applied.
+        Dictionary containing the provided parameters.
     """
-    return Annotated[dict, Depends(func)]
+    return {"q": q, "skip": skip, "limit": limit}
 
 
-# Example usage (executed only when module is run directly)
-if __name__ == "__main__":
-    from fastapi import FastAPI
+CommonParamsDep = Annotated[dict, Depends(common_parameters)]
 
-    app = FastAPI()
 
-    async def common_params(q: str | None = None):
-        return {"q": q}
+async def current_user(email: str) -> dict:
+    """Simulate user authentication dependency.
 
-    CommonDep = create_shared_dependency(common_params)
+    Args:
+        email: Email of the authenticated user.
 
-    @app.get("/items")
-    async def items(commons: CommonDep):
-        return commons
+    Returns:
+        Dictionary with user information.
+    """
+    return {"user_email": email}

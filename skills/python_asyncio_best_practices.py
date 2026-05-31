@@ -5,74 +5,126 @@ Source chunks: 4
 Source URLs:
 - https://dev.to/shehzan/mastering-python-async-patterns-a-complete-guide-to-asyncio-in-2026-10o6
 - https://discuss.python.org/t/asyncio-best-practices/12576
-Generated: 2026-05-31T19:33:17
+Generated: 2026-05-31T20:47:27
 Model: deepseek-r1:14b
 
 Do not edit by hand; rerun corpus2skill.py to regenerate.
 """
 
 """
-Python Asyncio Best Practices
-This module provides reusable helper functions for working with asyncio, including:
-- Concurrency controls
-- Batch processing utilities
-- HTTP client management
+Helper functions for working with Python's asyncio module following best practices.
+
+This module provides reusable patterns for common asynchronous operations,
+including task management, concurrency control, and error handling.
 """
 
 import asyncio
-from typing import Any, Sequence, Callable, Union
-import httpx
+import logging
+from typing import Any, Optional, List, Iterable, Callable, Coroutine
 
+logger = logging.getLogger(__name__)
 
-async def gather_with_concurrency(tasks: Sequence[Callable], concurrency_limit: int = 10) -> list[Any]:
+async def async_run_with_timeout(coro: Coroutine, timeout: float) -> tuple[bool, Optional[Any]]:
     """
-    Run tasks concurrently with a limit on the number of simultaneous tasks.
-    Returns results in the order they were received.
-    """
-    if not tasks:
-        return []
+    Run a coroutine with a specified timeout, returning whether it completed successfully.
     
-    results = []
-    task_batches = [tasks[i:i+concurrency_limit] for i in range(0, len(tasks), concurrency_limit)]
-    
-    for batch in task_batches:
-        batch_results = await asyncio.gather(*batch)
-        results.extend(batch_results)
+    Args:
+        coro: The coroutine to run
+        timeout: Maximum allowed time in seconds
         
-    return results
-
-
-async def async_batch_request(urls: Sequence[str], client_func: Callable[[], httpx.AsyncClient]) -> list[Any]:
+    Returns:
+        Tuple of (success: bool, result_or_error: Optional[Any])
     """
-    Make concurrent HTTP requests with rate limiting and proper resource management.
-    Takes a function that returns an AsyncClient instance.
-    Returns list of responses in the order of input URLs.
+    try:
+        return (True, await asyncio.wait_for(coro, timeout))
+    except asyncio.TimeoutError:
+        logger.warning(f"Coroutine {coro.__name__} timed out after {timeout}s")
+        return (False, "Timeout occurred")
+    except Exception as e:
+        logger.error(f"Coroutine {coro.__name__} failed: {e}")
+        return (False, str(e))
+
+def gather_with_limits(coroutines: Iterable[Coroutine], max_concurrent: int = 10) -> asyncio.Future:
     """
-    client = await client_func()
-    results = []
+    Run multiple coroutines concurrently with concurrency limits using a semaphore.
     
-    for i in range(0, len(urls), 50):
-        batch = urls[i:i+50]
-        async with client:
-            batch_results = await asyncio.gather(
-                *[client.get(url) for url in batch]
-            )
-            results.extend(batch_results)
-            await asyncio.sleep(1)  # Rate limiting
+    Args:
+        coroutines: Iterable of coroutine objects
+        max_concurrent: Maximum number of concurrent tasks
         
-    return [r.json() for r in results]
-
-
-async def measure_async_task_latency(func: Callable, *args, **kwargs) -> tuple[Any, float]:
+    Returns:
+        Future representing the gathering operation
     """
-    Measure the latency of an async function.
-    Returns (result, elapsed_time_in_seconds).
-    """
-    start = asyncio.get_event_loop().time()
-    result = await func(*args, **kwargs)
-    end = asyncio.get_event_loop().time()
-    return result, end - start
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async def run_coroutine(coro):
+        async with semaphore:
+            return await coro
+    return asyncio.gather(*[run_coroutine(c) for c in coroutines])
 
+def create_task_with_exception_handling(
+    coro: Coroutine, 
+    on_error: Optional[Callable[[Exception], None]] = None
+) -> asyncio.Task:
+    """
+    Create a task with proper exception handling and logging.
+    
+    Args:
+        coro: The coroutine to run as a task
+        on_error: Callback for handling exceptions (optional)
+        
+    Returns:
+        The created Task object
+    """
+    def error_handler(task: asyncio.Task):
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Task {task} failed: {exc}")
+            if on_error is not None:
+                on_error(exc)
+    task = asyncio.create_task(coro)
+    task.add_done_callback(error_handler)
+    return task
+
+async def run_blocking_functions_in_loop(
+    functions: List[Callable], 
+    loop: Optional[asyncio.AbstractEventLoop] = None
+) -> List[Any]:
+    """
+    Run synchronous blocking functions in an async event loop without blocking.
+    
+    Args:
+        functions: List of synchronous callables to execute
+        loop: Event loop to use (optional, default is current)
+        
+    Returns:
+        List of results from the function calls
+    """
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    tasks = []
+    for func in functions:
+        async def wrapper(f):
+            return await loop.run_in_executor(None, f)
+        tasks.append(wrapper(func))
+    return await asyncio.gather(*tasks)
+
+def measure_async_task_duration(coro: Coroutine) -> Callable:
+    """
+    Decorator to measure the duration of an async task.
+    
+    Args:
+        coro: The coroutine to wrap
+        
+    Returns:
+        Wrapped coroutine with timing measurements
+    """
+    async def timed_coroutine():
+        start = asyncio.get_event_loop().time()
+        result = await coro
+        duration = asyncio.get_event_loop().time() - start
+        logger.info(f"{coro.__name__} completed in {duration:.2f}s")
+        return result
+    return timed_coroutine
 
 if __name__ == "__main__":
-    pass
+    pass  # Example usage can go here if needed

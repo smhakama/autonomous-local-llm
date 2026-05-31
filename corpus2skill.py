@@ -49,6 +49,12 @@ DEFAULT_MYPY_BIN = "mypy"
 DEFAULT_ASK_GEMINI_BIN = "ask_gemini"
 DEFAULT_GEMINI_REVIEW_TIMEOUT = 90  # full skill review は時間がかかる
 
+# --- Phase 3.3 RAG-augmented distillation 定数 ---
+DEFAULT_RAG_COLLECTION = "web_brain"  # Layer 1 raw chunks (125 pts)
+DEFAULT_RAG_TOP_K = 2  # 注入する追加 chunks 数 (prompt 増大による 14B 混乱回避)
+DEFAULT_RAG_MAX_CHARS = 1000  # 各 RAG chunk の最大文字数 (truncate 後 ...)
+RAG_EMBED_MODEL = "bge-m3"
+
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
 Output EXACTLY one line per callable, format:
@@ -95,8 +101,14 @@ CRITICAL RULES:
 --- BEGIN CHUNKS ---
 {joined_chunks}
 --- END CHUNKS ---
-
+{rag_section}
 Output the Python module now (ONLY the ```python``` code block):"""
+
+RAG_CONTEXT_SECTION_TEMPLATE = """
+--- ADDITIONAL CONTEXT (raw doc chunks, use for API/syntax accuracy, do NOT copy verbatim) ---
+{rag_joined}
+--- END ADDITIONAL CONTEXT ---
+"""
 
 
 @dataclass(frozen=True)
@@ -160,18 +172,79 @@ def validate_python_syntax(code: str) -> tuple[bool, str | None]:
         return False, f"SyntaxError at line {e.lineno}: {e.msg}"
 
 
-def build_distillation_prompt(theme: str, chunks: list[dict]) -> str:
+def build_distillation_prompt(
+    theme: str,
+    chunks: list[dict],
+    *,
+    rag_chunks: list[dict] | None = None,
+) -> str:
     joined = "\n\n--- CHUNK SEPARATOR ---\n\n".join(
         f"### Source: {c.get('url', 'unknown')}\n"
         f"### Heading: {c.get('heading_path', '')}\n\n"
         f"{c.get('text', '')}"
         for c in chunks
     )
+    rag_section = ""
+    if rag_chunks:
+        rag_joined = "\n\n--- CHUNK SEPARATOR ---\n\n".join(
+            f"### Source: {c.get('url', 'unknown')}\n"
+            f"### Heading: {c.get('heading_path', '')}\n\n"
+            f"{c.get('text', '')}"
+            for c in rag_chunks
+        )
+        rag_section = RAG_CONTEXT_SECTION_TEMPLATE.format(rag_joined=rag_joined)
     return DISTILL_PROMPT_TEMPLATE.format(
         theme=theme,
         n_chunks=len(chunks),
         joined_chunks=joined,
+        rag_section=rag_section,
     )
+
+
+def embed_query(text: str, *, model: str = RAG_EMBED_MODEL) -> list[float]:
+    """bge-m3 (default) で 1 query を embed。corpus2skill 専用の薄い wrapper。"""
+    r = requests.post(
+        f"{OLLAMA_URL}/api/embeddings",
+        json={"model": model, "prompt": text},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()["embedding"]
+
+
+def retrieve_rag_chunks(
+    qd: QdrantClient,
+    query: str,
+    *,
+    collection: str = DEFAULT_RAG_COLLECTION,
+    top_k: int = DEFAULT_RAG_TOP_K,
+    max_chars: int = DEFAULT_RAG_MAX_CHARS,
+) -> list[dict]:
+    """bge-m3 で query を embed → collection に対し vector search top-K の
+    payload を返す。max_chars > 0 なら各 payload['text'] を truncate。
+    collection 不在/embed 失敗時は [] (上位で graceful skip)。"""
+    try:
+        vec = embed_query(query)
+    except requests.exceptions.RequestException as e:
+        print(f"[RAG] embed failed: {e}", file=sys.stderr)
+        return []
+    try:
+        resp = qd.query_points(
+            collection_name=collection,
+            query=vec,
+            limit=top_k,
+            with_payload=True,
+        )
+    except Exception as e:
+        print(f"[RAG] search failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return []
+    payloads = [dict(p.payload) for p in resp.points]
+    if max_chars > 0:
+        for p in payloads:
+            text = p.get("text", "")
+            if len(text) > max_chars:
+                p["text"] = text[:max_chars] + " ..."
+    return payloads
 
 
 def call_14b(prompt: str, *, model: str = DEFAULT_MODEL, timeout: int = DEFAULT_TIMEOUT) -> str:
@@ -417,6 +490,10 @@ def distill(
     mypy_bin: str = DEFAULT_MYPY_BIN,
     ask_gemini_bin: str = DEFAULT_ASK_GEMINI_BIN,
     gemini_timeout: int = DEFAULT_GEMINI_REVIEW_TIMEOUT,
+    rag_augmented: bool = False,
+    rag_top_k: int = DEFAULT_RAG_TOP_K,
+    rag_collection: str = DEFAULT_RAG_COLLECTION,
+    rag_max_chars: int = DEFAULT_RAG_MAX_CHARS,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -438,7 +515,21 @@ def distill(
     for u in source_urls:
         print(f"        - {u}")
 
-    prompt = build_distillation_prompt(theme, chunks)
+    rag_chunks: list[dict] = []
+    if rag_augmented:
+        rag_chunks = retrieve_rag_chunks(
+            qd, theme,
+            collection=rag_collection, top_k=rag_top_k, max_chars=rag_max_chars,
+        )
+        rag_urls = sorted({c.get("url", "") for c in rag_chunks if c.get("url")})
+        print(
+            f"      [RAG] retrieved {len(rag_chunks)} additional chunks "
+            f"from {rag_collection} ({len(rag_urls)} unique URLs)"
+        )
+        for u in rag_urls:
+            print(f"        + {u}")
+
+    prompt = build_distillation_prompt(theme, chunks, rag_chunks=rag_chunks)
     print(f"[2/3] prompt size: {len(prompt)} chars")
 
     last_err: str | None = None
@@ -680,6 +771,29 @@ def main() -> int:
         "--gemini-timeout", type=int, default=DEFAULT_GEMINI_REVIEW_TIMEOUT,
         help=f"Gemini review timeout 秒 (default {DEFAULT_GEMINI_REVIEW_TIMEOUT})",
     )
+    # --- Phase 3.3 RAG-augmented distillation 引数 ---
+    ap.add_argument(
+        "--rag-augmented", action="store_true",
+        help=(
+            "bge-m3 + Qdrant vector search で関連 chunks を取得し、"
+            "14B prompt に ADDITIONAL CONTEXT として注入 (default OFF、Phase 3.3)"
+        ),
+    )
+    ap.add_argument(
+        "--rag-top-k", type=int, default=DEFAULT_RAG_TOP_K,
+        help=f"RAG retrieval top-K (default {DEFAULT_RAG_TOP_K})",
+    )
+    ap.add_argument(
+        "--rag-collection", default=DEFAULT_RAG_COLLECTION,
+        help=f"RAG retrieval source collection (default {DEFAULT_RAG_COLLECTION!r})",
+    )
+    ap.add_argument(
+        "--rag-max-chars", type=int, default=DEFAULT_RAG_MAX_CHARS,
+        help=(
+            f"各 RAG chunk の最大文字数 (default {DEFAULT_RAG_MAX_CHARS}、"
+            "prompt 肥大化抑制、0 で無効)"
+        ),
+    )
     args = ap.parse_args()
 
     result = distill(
@@ -694,6 +808,10 @@ def main() -> int:
         mypy_bin=args.mypy_bin,
         ask_gemini_bin=args.ask_gemini_bin,
         gemini_timeout=args.gemini_timeout,
+        rag_augmented=args.rag_augmented,
+        rag_top_k=args.rag_top_k,
+        rag_collection=args.rag_collection,
+        rag_max_chars=args.rag_max_chars,
     )
     if not result.valid:
         print(
