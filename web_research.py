@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """web_research.py — テーマ駆動 web research → bge-m3 → Qdrant.
 
-Phase 2 v2: Discovery は DuckDuckGo HTML を直接スクレイプ (LLM 不使用)。
+Phase 2 v2: Discovery は検索エンジン HTML を直接スクレイプ (LLM 不使用)。
 v1 (Agent ベース) は qwen2.5:7b-32k が Tool call の URL フィールドに思考を
 混入する破綻が出たため、Discovery を決定論的処理に置き換えた。
 
-    [DDG HTML search] → URL 候補抽出 (BeautifulSoup)
+    [SearxNG JSON API] → URL 候補抽出
         ↓
     [Domain Allowlist/Denylist] → 優先度スコアで採択
         ↓
@@ -34,6 +34,15 @@ Phase 2.1b で追加:
 - --themes-file <path>: 1 行 1 テーマのバッチ実行
 - --lock-file: fcntl.flock による多重起動防止
 - --strict: 1 件失敗で全体停止 (default は継続)
+
+Discovery backend (2026-05-31):
+- DuckDuckGo HTML (html.duckduckgo.com/html/) は WSL 帯から
+  status=202 + 空結果を返すようになり scrape 不能。
+- Brave HTML scrape も試したが rate limit が厳しく (~1 req で 429、
+  cooldown 30-60 秒)、--themes-file × --expand-query 運用に不適。
+- SearxNG (self-host, http://127.0.0.1:8888) に置換。
+  内部で brave/mojeek/qwant 等を並列叩き、JSON で集約結果を返す。
+  rate limit は self-host なので無し。container 設定は ~/searxng/。
 """
 from __future__ import annotations
 
@@ -48,11 +57,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterator
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urlparse
 
 import html2text
 import requests
-from bs4 import BeautifulSoup
 from playwright.async_api import (
     Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
@@ -84,13 +92,13 @@ FETCH_BACKOFF_MAX_SEC = 8.0
 HEADING_CHUNK_MAX_CHARS = 3000
 HEADING_CHUNK_MIN_CHARS = 200
 
-DDG_HTML_URL = "https://html.duckduckgo.com/html/"
-DDG_USER_AGENT = (
+SEARXNG_URL = "http://127.0.0.1:8888/search"
+BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-DDG_FETCH_TIMEOUT_SEC = 30
-DDG_CANDIDATES_PER_QUERY = 30  # スコアリング前の候補上限
+SEARCH_FETCH_TIMEOUT_SEC = 30
+SEARCH_CANDIDATES_PER_QUERY = 30  # スコアリング前の候補上限
 
 DOMAIN_PRIORITY: dict[str, int] = {
     "fastapi.tiangolo.com": 5,
@@ -159,47 +167,36 @@ def _domain_score(url: str) -> int:
     return DOMAIN_PRIORITY.get(host, 0)
 
 
-def _unwrap_ddg(href: str) -> str:
-    """DDG は外部リンクを /l/?uddg=<encoded-url>&... でラップする場合がある。"""
-    if href.startswith("//"):
-        href = "https:" + href
+def discover_urls_via_searxng(theme: str, max_pages: int) -> list[str]:
+    """SearxNG (self-host) JSON API → URL リストを優先度順に返す。"""
+    print(f"=== SearxNG search: {theme!r}")
     try:
-        p = urlparse(href)
-    except ValueError:
-        return href
-    if p.netloc.endswith("duckduckgo.com") and p.path in ("/l/", "/l"):
-        qs = parse_qs(p.query)
-        uddg = qs.get("uddg", [])
-        if uddg:
-            return unquote(uddg[0])
-    return href
-
-
-def discover_urls_via_ddg(theme: str, max_pages: int) -> list[str]:
-    """DuckDuckGo HTML を直接スクレイプ → URL リストを優先度順に返す。"""
-    print(f"=== DDG HTML search: {theme!r}")
-    try:
-        r = requests.post(
-            DDG_HTML_URL,
-            data={"q": theme},
-            headers={"User-Agent": DDG_USER_AGENT, "Accept-Language": "ja,en"},
-            timeout=DDG_FETCH_TIMEOUT_SEC,
+        r = requests.get(
+            SEARXNG_URL,
+            params={"q": theme, "format": "json", "language": "all"},
+            headers={"User-Agent": BROWSER_USER_AGENT},
+            timeout=SEARCH_FETCH_TIMEOUT_SEC,
         )
         r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        print(f"[ERROR] DDG fetch failed: {e}", file=sys.stderr)
+        print(f"[ERROR] SearxNG fetch failed: {e}", file=sys.stderr)
         return []
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    raw_results = data.get("results", [])
+    unresponsive = data.get("unresponsive_engines", [])
+    if unresponsive:
+        print(f"  (unresponsive engines: {unresponsive})")
+
     raw_candidates: list[str] = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href", "")
-        if href:
-            raw_candidates.append(_unwrap_ddg(href))
-        if len(raw_candidates) >= DDG_CANDIDATES_PER_QUERY:
+    for item in raw_results:
+        url = item.get("url", "")
+        if url:
+            raw_candidates.append(url)
+        if len(raw_candidates) >= SEARCH_CANDIDATES_PER_QUERY:
             break
 
-    print(f"DDG raw candidates: {len(raw_candidates)} 件")
+    print(f"SearxNG raw candidates: {len(raw_candidates)} 件")
     seen: set[str] = set()
     filtered: list[str] = []
     for url in raw_candidates:
@@ -244,7 +241,7 @@ async def fetch_page(url: str) -> PageDoc | None:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             try:
-                ctx = await browser.new_context(user_agent=DDG_USER_AGENT)
+                ctx = await browser.new_context(user_agent=BROWSER_USER_AGENT)
                 page = await ctx.new_page()
 
                 @retry(
@@ -594,7 +591,7 @@ async def run_research(
     seen_urls: set[str] = set()
     all_urls: list[str] = []
     for q in queries:
-        for u in discover_urls_via_ddg(q, max_pages=max_pages):
+        for u in discover_urls_via_searxng(q, max_pages=max_pages):
             if u not in seen_urls:
                 seen_urls.add(u)
                 all_urls.append(u)
