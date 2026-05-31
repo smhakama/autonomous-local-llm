@@ -570,6 +570,11 @@ async def run_research(
         "nav", "footer", "sidebar", "related", "menu", "breadcrumb",
     ),
     cleanse_collection: str = "web_brain_clean",
+    cleanse_filter_mode: str = "nav-only",
+    cleanse_body_min_chars: int = 1000,
+    cleanse_body_max_chars: int = 2000,
+    cleanse_per_url_top: int = 3,
+    cleanse_cosine_gate: float = 0.9,
 ) -> int:
     print(f"=== theme: {theme!r} ===")
     print(f"=== embed model: {EMBED_MODEL} ===")
@@ -640,8 +645,13 @@ async def run_research(
                 max_chunks=cleanse_max_chunks_per_page,
                 per_chunk_timeout=cleanse_per_chunk_timeout,
                 output_mode="new-collection",
+                filter_mode=cleanse_filter_mode,
                 filter_max_chars=cleanse_filter_max_chars,
                 filter_heading_keywords=cleanse_filter_heading_keywords,
+                body_min_chars=cleanse_body_min_chars,
+                body_max_chars=cleanse_body_max_chars,
+                per_url_top=cleanse_per_url_top,
+                cosine_gate=cleanse_cosine_gate,
                 clean_collection=cleanse_collection,
                 qd_client=qd,
             )
@@ -742,6 +752,11 @@ async def amain(args: argparse.Namespace) -> int:
                             args.cleanse_filter_heading_keywords
                         ),
                         cleanse_collection=args.cleanse_collection,
+                        cleanse_filter_mode=args.cleanse_filter_mode,
+                        cleanse_body_min_chars=args.cleanse_body_min_chars,
+                        cleanse_body_max_chars=args.cleanse_body_max_chars,
+                        cleanse_per_url_top=args.cleanse_per_url_top,
+                        cleanse_cosine_gate=args.cleanse_cosine_gate,
                     )
                     if rc != 0:
                         failed.append(theme)
@@ -797,6 +812,11 @@ async def amain(args: argparse.Namespace) -> int:
             args.cleanse_filter_heading_keywords
         ),
         cleanse_collection=args.cleanse_collection,
+        cleanse_filter_mode=args.cleanse_filter_mode,
+        cleanse_body_min_chars=args.cleanse_body_min_chars,
+        cleanse_body_max_chars=args.cleanse_body_max_chars,
+        cleanse_per_url_top=args.cleanse_per_url_top,
+        cleanse_cosine_gate=args.cleanse_cosine_gate,
     )
 
 
@@ -873,6 +893,31 @@ def main() -> int:
     ap.add_argument(
         "--cleanse-collection", default="web_brain_clean",
         help="cleanse 結果を投入する Qdrant collection (default web_brain_clean)",
+    )
+    # --- Phase 2.5b3 body-sample filter mode 引数 (cleanse_chunk.py へ pass-through) ---
+    ap.add_argument(
+        "--cleanse-filter-mode",
+        choices=("nav-only", "body-sample", "all"), default="nav-only",
+        help=(
+            "filter mode (default nav-only): nav-only=既存 / "
+            "body-sample=本文 chunk URL 別 top-N / all=フィルタ無効"
+        ),
+    )
+    ap.add_argument(
+        "--cleanse-body-min-chars", type=int, default=1000,
+        help="body-sample mode: chars 下限 (default 1000)",
+    )
+    ap.add_argument(
+        "--cleanse-body-max-chars", type=int, default=2000,
+        help="body-sample mode: chars 上限 (default 2000、num_predict 1200 と整合)",
+    )
+    ap.add_argument(
+        "--cleanse-per-url-top", type=int, default=3,
+        help="body-sample mode: URL あたり代表 chunk 数 (default 3、0 で無効)",
+    )
+    ap.add_argument(
+        "--cleanse-cosine-gate", type=float, default=0.9,
+        help="upsert 時 cosine 閾値 (default 0.9、0.0 で gate 無効)",
     )
     args = ap.parse_args()
     return asyncio.run(amain(args))

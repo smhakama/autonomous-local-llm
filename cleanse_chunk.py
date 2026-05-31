@@ -51,18 +51,26 @@ CLEANSE_MODEL = "deepseek-r1:14b"
 EMBED_MODEL = "bge-m3"
 DEFAULT_LIMIT = 20  # Qdrant scroll 上限 (filter 前の input pool)
 GENERATE_TIMEOUT_SEC = 300  # 14B cold load 85s + inference 余裕
-NUM_PREDICT = 2048
+NUM_PREDICT = 1200  # Phase 2.5b3: 本文 2000 chars ≈ 500 tokens output、think 余地込み
 
 # --- Phase 2.5b1 セーフティネット定数 ---
 DEFAULT_MAX_CHUNKS = 5  # 1 batch の最大 cleanse 件数 (暴走防止)
 DEFAULT_PER_CHUNK_TIMEOUT = 180  # 1 chunk あたり (秒)
-DEFAULT_FILTER_MAX_CHARS = 1500  # 短い chunk のみ cleanse 対象
+DEFAULT_FILTER_MAX_CHARS = 1500  # 短い chunk のみ cleanse 対象 (nav-only mode)
 DEFAULT_FILTER_HEADING_KEYWORDS = (
     "nav", "footer", "sidebar", "related", "menu", "breadcrumb",
 )
 DEFAULT_SIDECAR_DIR = "cleanse_output"
 DEFAULT_OUTPUT_MODE = "sidecar"  # 最安全 (Qdrant 触らず)
 OUTPUT_MODES = ("sidecar", "new-collection", "update-payload", "preview")
+
+# --- Phase 2.5b3 body-sample filter mode 定数 ---
+FILTER_MODES = ("nav-only", "body-sample", "all")
+DEFAULT_FILTER_MODE = "nav-only"  # 後方互換 (Phase 2.5b1/b2 既存挙動)
+DEFAULT_BODY_MIN_CHARS = 1000  # body-sample: 下限 (fragment 除外)
+DEFAULT_BODY_MAX_CHARS = 2000  # body-sample: 上限 (Phase 2.5b3 smoke: 3500 だと 300s timeout、2000 で num_predict 1200 と整合)
+DEFAULT_PER_URL_TOP = 3  # body-sample: URL あたり代表 chunk 数
+DEFAULT_COSINE_GATE = 0.9  # upsert 時 cosine 閾値 (Phase 2.5a 実測 0.9950 と整合)
 
 
 @dataclass(frozen=True)
@@ -83,7 +91,9 @@ class CleanseResult:
     skip_reason: str | None
     batch_id: str
 
-CLEANSE_PROMPT_TEMPLATE = """You are a knowledge-base cleaner. Below is a Markdown chunk scraped from a webpage. Clean it for storage in a semantic search index:
+CLEANSE_PROMPT_TEMPLATE = """You are a knowledge-base cleaner. Below is a Markdown chunk scraped from a webpage. Clean it for storage in a semantic search index.
+
+CRITICAL: Do NOT output <think> blocks. Do NOT use chain-of-thought reasoning. Skip all internal deliberation and output the cleaned Markdown directly.
 
 REMOVE:
 - Navigation menus, breadcrumbs, sidebars
@@ -98,7 +108,7 @@ KEEP:
 - Quotations and lists
 - Headings (# / ## / ###) that introduce real content
 
-Output ONLY the cleaned Markdown, no commentary, no explanation.
+Output ONLY the cleaned Markdown, no commentary, no explanation, no reasoning.
 
 --- BEGIN CHUNK ---
 {text}
@@ -173,17 +183,47 @@ def fetch_chunks(qd: QdrantClient, limit: int, theme: str | None) -> list[dict]:
 
 def passes_filter(
     payload: dict,
-    filter_max_chars: int,
-    filter_heading_keywords: tuple[str, ...],
+    filter_max_chars: int = DEFAULT_FILTER_MAX_CHARS,
+    filter_heading_keywords: tuple[str, ...] = DEFAULT_FILTER_HEADING_KEYWORDS,
+    *,
+    filter_mode: str = DEFAULT_FILTER_MODE,
+    body_min_chars: int = DEFAULT_BODY_MIN_CHARS,
+    body_max_chars: int = DEFAULT_BODY_MAX_CHARS,
 ) -> tuple[bool, str | None]:
-    """セーフティ filter: AND ロジックで「短い + nav-like heading」のみ採択。
+    """セーフティ filter: filter_mode 別ロジックで chunk 採否を判定。
 
-    filter_max_chars <= 0 で文字数チェック無効。
-    filter_heading_keywords が空 tuple で keyword チェック無効。
+    nav-only (default、後方互換):
+        AND「chars <= filter_max_chars」+「heading に nav-like keyword 含む」
+        filter_max_chars <= 0 で文字数チェック無効。
+        filter_heading_keywords が空 tuple で keyword チェック無効。
+
+    body-sample (Phase 2.5b3 新規):
+        AND「heading に nav-like keyword 含**まない**」+「chars in [body_min, body_max]」
+        filter_heading_keywords が空 tuple なら nav 判定 skip (全 chunk が本文扱い)。
+
+    all (危険、要 warning):
+        常に True。
     """
     text = payload.get("text", "")
     heading = (payload.get("heading_path") or "").lower()
 
+    if filter_mode == "all":
+        return True, None
+
+    if filter_mode == "body-sample":
+        if filter_heading_keywords and any(
+            kw.lower() in heading for kw in filter_heading_keywords
+        ):
+            preview = heading[:40] + ("…" if len(heading) > 40 else "")
+            return False, f"heading {preview!r} matches nav-like keyword (body-sample excludes nav)"
+        n = len(text)
+        if n < body_min_chars:
+            return False, f"chars {n} < body_min {body_min_chars}"
+        if n > body_max_chars:
+            return False, f"chars {n} > body_max {body_max_chars}"
+        return True, None
+
+    # filter_mode == "nav-only" (既存挙動)
     if filter_max_chars > 0 and len(text) > filter_max_chars:
         return False, f"chars {len(text)} > max {filter_max_chars}"
     if filter_heading_keywords:
@@ -191,6 +231,62 @@ def passes_filter(
             preview = heading[:40] + ("…" if len(heading) > 40 else "")
             return False, f"heading {preview!r} has no nav-like keyword"
     return True, None
+
+
+def select_chunks(
+    chunks: list[dict],
+    *,
+    filter_mode: str = DEFAULT_FILTER_MODE,
+    filter_max_chars: int = DEFAULT_FILTER_MAX_CHARS,
+    filter_heading_keywords: tuple[str, ...] = DEFAULT_FILTER_HEADING_KEYWORDS,
+    body_min_chars: int = DEFAULT_BODY_MIN_CHARS,
+    body_max_chars: int = DEFAULT_BODY_MAX_CHARS,
+    per_url_top: int = DEFAULT_PER_URL_TOP,
+) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """filter + per-URL top-N truncation を 1 step で実施。
+
+    per_url_top <= 0 で URL 上限無効 (全採択)。nav-only / all mode では URL 上限を
+    適用しない (nav-only は対象が稀、all は本来全件投入意図のため意味がない)。
+
+    Returns: (selected, skipped_with_reason)
+        selected: filter 通過 + URL 上限内の chunk リスト
+        skipped_with_reason: 落ちた chunk と理由のタプルリスト
+    """
+    if filter_mode not in FILTER_MODES:
+        raise ValueError(f"invalid filter_mode {filter_mode!r}, expect one of {FILTER_MODES}")
+
+    eligible: list[dict] = []
+    skipped: list[tuple[dict, str]] = []
+    for p in chunks:
+        ok, reason = passes_filter(
+            p,
+            filter_max_chars,
+            filter_heading_keywords,
+            filter_mode=filter_mode,
+            body_min_chars=body_min_chars,
+            body_max_chars=body_max_chars,
+        )
+        if ok:
+            eligible.append(p)
+        else:
+            skipped.append((p, reason or "filtered"))
+
+    if filter_mode != "body-sample" or per_url_top <= 0:
+        return eligible, skipped
+
+    selected: list[dict] = []
+    per_url_count: dict[str, int] = {}
+    for p in eligible:
+        url = p.get("url", "")
+        c = per_url_count.get(url, 0)
+        if c < per_url_top:
+            selected.append(p)
+            per_url_count[url] = c + 1
+        else:
+            skipped.append(
+                (p, f"per-URL top {per_url_top} exceeded for url={url!r}")
+            )
+    return selected, skipped
 
 
 def _make_chunk_id(payload: dict) -> str:
@@ -228,12 +324,18 @@ def _upsert_to_clean_collection(
     *,
     collection: str = DEFAULT_CLEAN_COLLECTION,
     vec_dim: int = CLEAN_VEC_DIM,
-) -> int:
+    cosine_gate: float = 0.0,
+) -> tuple[int, int]:
     """cleanse 結果を別 collection に upsert (元 collection は無変更)。
 
     point ID = sha1("clean::" + chunk_id + "::" + batch_id) → UUID で決定論的。
     payload に source_chunk_id / cosine_with_original / 元/cleansed chars を保存
     することで追跡可能性 + 品質メトリクスを残す。
+
+    cosine_gate > 0 のとき r.cosine < gate の point は upsert を skip
+    (低品質 cleanse の混入防止)。default 0.0 で gate 無効 (後方互換)。
+
+    Returns: (upserted_count, gate_skipped_count)
     """
     if not qd.collection_exists(collection):
         qd.create_collection(
@@ -242,9 +344,18 @@ def _upsert_to_clean_collection(
         )
         print(f"created clean collection: {collection} (dim={vec_dim})")
 
+    gate_skipped = 0
     points: list[PointStruct] = []
     for r in results:
         if r.skipped or not r.cleansed_text.strip():
+            continue
+        if cosine_gate > 0 and r.cosine < cosine_gate:
+            print(
+                f"  [GATE-SKIP] chunk_id={r.chunk_id!r} "
+                f"cosine={r.cosine:.4f} < gate {cosine_gate}",
+                file=sys.stderr,
+            )
+            gate_skipped += 1
             continue
         try:
             vec = embed(r.cleansed_text)
@@ -274,7 +385,7 @@ def _upsert_to_clean_collection(
         )
     if points:
         qd.upsert(collection, points=points)
-    return len(points)
+    return len(points), gate_skipped
 
 
 def cleanse_batch(
@@ -286,32 +397,48 @@ def cleanse_batch(
     output_mode: str = DEFAULT_OUTPUT_MODE,
     sidecar_path: str | None = None,
     batch_id: str | None = None,
+    filter_mode: str = DEFAULT_FILTER_MODE,
     filter_max_chars: int = DEFAULT_FILTER_MAX_CHARS,
     filter_heading_keywords: tuple[str, ...] = DEFAULT_FILTER_HEADING_KEYWORDS,
+    body_min_chars: int = DEFAULT_BODY_MIN_CHARS,
+    body_max_chars: int = DEFAULT_BODY_MAX_CHARS,
+    per_url_top: int = DEFAULT_PER_URL_TOP,
+    cosine_gate: float = DEFAULT_COSINE_GATE,
     clean_collection: str = DEFAULT_CLEAN_COLLECTION,
     qd_client: QdrantClient | None = None,
 ) -> list[CleanseResult]:
     """セーフティネット込みのバッチ cleanse。
 
-    順序: filter → max_chunks で truncate → dry-run なら一覧のみ
-          → 各 chunk を timeout 保護で cleanse → output_mode で保存。
+    順序: select_chunks (filter + per-URL truncation) → max_chunks で truncate
+          → dry-run なら一覧のみ → 各 chunk を timeout 保護で cleanse
+          → output_mode で保存 (new-collection 時は cosine_gate で upsert ふるい)。
 
     Returns: CleanseResult のリスト (dry-run 時は空 list)。
     """
     if output_mode not in OUTPUT_MODES:
         raise ValueError(f"invalid output_mode {output_mode!r}, expect one of {OUTPUT_MODES}")
+    if filter_mode not in FILTER_MODES:
+        raise ValueError(f"invalid filter_mode {filter_mode!r}, expect one of {FILTER_MODES}")
     if batch_id is None:
         batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1. filter
-    eligible: list[dict] = []
-    skipped: list[tuple[dict, str]] = []
-    for p in chunks:
-        ok, reason = passes_filter(p, filter_max_chars, filter_heading_keywords)
-        if ok:
-            eligible.append(p)
-        else:
-            skipped.append((p, reason or "filtered"))
+    if filter_mode == "all":
+        print(
+            "[WARN] filter_mode='all' is selected — no safety filter applied. "
+            "Verify max_chunks is small enough to avoid runaway cost.",
+            file=sys.stderr,
+        )
+
+    # 1. filter + per-URL truncation
+    eligible, skipped = select_chunks(
+        chunks,
+        filter_mode=filter_mode,
+        filter_max_chars=filter_max_chars,
+        filter_heading_keywords=filter_heading_keywords,
+        body_min_chars=body_min_chars,
+        body_max_chars=body_max_chars,
+        per_url_top=per_url_top,
+    )
 
     # 2. max_chunks で truncate
     selected = eligible[:max_chunks]
@@ -411,12 +538,15 @@ def cleanse_batch(
         print(f"\nsidecar written: {path} ({len(results)} lines)")
     elif output_mode == "new-collection":
         qd = qd_client or QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        n = _upsert_to_clean_collection(
-            qd, results, collection=clean_collection,
+        n_up, n_gate = _upsert_to_clean_collection(
+            qd, results, collection=clean_collection, cosine_gate=cosine_gate,
         )
+        empty_or_err = len(results) - n_up - n_gate
         print(
             f"\nupserted to clean collection '{clean_collection}': "
-            f"{n} points ({len(results) - n} skipped/empty)"
+            f"{n_up} points "
+            f"(gate-skipped {n_gate} @ cosine<{cosine_gate}, "
+            f"empty/error {empty_or_err})"
         )
     elif output_mode == "update-payload":
         print(
@@ -494,6 +624,44 @@ def main() -> int:
             f"(default {DEFAULT_CLEAN_COLLECTION})"
         ),
     )
+    # --- Phase 2.5b3 body-sample filter mode 引数 ---
+    ap.add_argument(
+        "--filter-mode", choices=FILTER_MODES, default=DEFAULT_FILTER_MODE,
+        help=(
+            f"filter mode (default {DEFAULT_FILTER_MODE}): "
+            "nav-only=従来の AND ロジック / "
+            "body-sample=本文 chunk を URL 別 top-N で採択 / "
+            "all=フィルタ無効 (危険、warning 表示)"
+        ),
+    )
+    ap.add_argument(
+        "--body-min-chars", type=int, default=DEFAULT_BODY_MIN_CHARS,
+        help=(
+            f"body-sample mode: chars 下限 (default {DEFAULT_BODY_MIN_CHARS}、"
+            "fragment 除外)"
+        ),
+    )
+    ap.add_argument(
+        "--body-max-chars", type=int, default=DEFAULT_BODY_MAX_CHARS,
+        help=(
+            f"body-sample mode: chars 上限 (default {DEFAULT_BODY_MAX_CHARS}、"
+            "14B context 余裕考慮)"
+        ),
+    )
+    ap.add_argument(
+        "--per-url-top", type=int, default=DEFAULT_PER_URL_TOP,
+        help=(
+            f"body-sample mode: URL あたり代表 chunk 数 "
+            f"(default {DEFAULT_PER_URL_TOP}、0 で URL 上限無効)"
+        ),
+    )
+    ap.add_argument(
+        "--cosine-gate", type=float, default=DEFAULT_COSINE_GATE,
+        help=(
+            f"upsert 時 cosine 閾値 (default {DEFAULT_COSINE_GATE}、"
+            "0.0 で gate 無効)"
+        ),
+    )
     args = ap.parse_args()
 
     raw_kw = (args.filter_heading_keywords or "").strip()
@@ -522,8 +690,13 @@ def main() -> int:
         output_mode=args.output_mode,
         sidecar_path=args.sidecar_path,
         batch_id=args.batch_id,
+        filter_mode=args.filter_mode,
         filter_max_chars=args.filter_max_chars,
         filter_heading_keywords=keywords,
+        body_min_chars=args.body_min_chars,
+        body_max_chars=args.body_max_chars,
+        per_url_top=args.per_url_top,
+        cosine_gate=args.cosine_gate,
         clean_collection=args.clean_collection,
         qd_client=qd,
     )
