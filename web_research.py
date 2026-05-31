@@ -27,14 +27,19 @@ CLI:
     python web_research.py --test-markdown <URL>
 
 Phase 2 で意図的に未実装 (Phase 2.1+ で追加予定):
-- query expansion (1-shot LLM call で検索キーワード拡張)
-- cron / themes.txt / 多重起動防止
-- deepseek-r1:14b による 2nd-stage cleanse
+- query expansion (1-shot LLM call で検索キーワード拡張) — Phase 2.1c
+- deepseek-r1:14b による 2nd-stage cleanse — Phase 2.5
+
+Phase 2.1b で追加:
+- --themes-file <path>: 1 行 1 テーマのバッチ実行
+- --lock-file: fcntl.flock による多重起動防止
+- --strict: 1 件失敗で全体停止 (default は継続)
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import sys
 import time
@@ -446,6 +451,37 @@ def demo_search(qd: QdrantClient, query: str, top: int = 5) -> None:
         print(f"      | {head}")
 
 
+def parse_themes_file(path: str) -> list[str]:
+    """themes.txt をパースして正規化済 theme リストを返す。
+
+    フォーマット:
+    - 1 行 1 テーマ
+    - 空行スキップ
+    - 行頭 # コメント行スキップ
+    - UTF-8 BOM 除去 (utf-8-sig)
+    - 行末空白 trim
+    - 大文字小文字無視で重複検出 → 警告 + 1 回だけ採用
+    """
+    with open(path, encoding="utf-8-sig") as f:
+        raw_lines = f.readlines()
+    seen_lower: set[str] = set()
+    themes: list[str] = []
+    for lineno, line in enumerate(raw_lines, 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        key = s.lower()
+        if key in seen_lower:
+            print(
+                f"[WARN] themes-file line {lineno}: duplicate skipped: {s!r}",
+                file=sys.stderr,
+            )
+            continue
+        seen_lower.add(key)
+        themes.append(s)
+    return themes
+
+
 async def run_research(theme: str, max_pages: int) -> int:
     print(f"=== theme: {theme!r} ===")
     print(f"=== embed model: {EMBED_MODEL} ===")
@@ -511,8 +547,74 @@ async def amain(args: argparse.Namespace) -> int:
         demo_search(qd, args.search, top=args.top)
         return 0
 
+    if args.themes_file:
+        try:
+            themes = parse_themes_file(args.themes_file)
+        except FileNotFoundError:
+            print(f"[ERROR] themes file not found: {args.themes_file}", file=sys.stderr)
+            return 1
+        if not themes:
+            print(f"[ERROR] no themes in {args.themes_file}", file=sys.stderr)
+            return 1
+
+        try:
+            lock_fp = open(args.lock_file, "w")
+        except OSError as e:
+            print(f"[ERROR] cannot open lock file {args.lock_file}: {e}", file=sys.stderr)
+            return 1
+        try:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(
+                f"[ERROR] another instance is running (lock: {args.lock_file})",
+                file=sys.stderr,
+            )
+            lock_fp.close()
+            return 1
+
+        failed: list[str] = []
+        try:
+            for i, theme in enumerate(themes, 1):
+                print(f"\n=== [{i}/{len(themes)}] theme: {theme!r} ===")
+                try:
+                    rc = await run_research(theme, args.max_pages)
+                    if rc != 0:
+                        failed.append(theme)
+                        if args.strict:
+                            print(
+                                f"[ERROR] --strict: stopping on {theme!r}",
+                                file=sys.stderr,
+                            )
+                            return rc
+                except Exception as e:
+                    failed.append(theme)
+                    print(
+                        f"[ERROR] theme {theme!r} raised "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    if args.strict:
+                        return 1
+        finally:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            lock_fp.close()
+
+        if failed:
+            print(
+                f"\n[SUMMARY] {len(failed)}/{len(themes)} themes failed: "
+                f"{failed}",
+                file=sys.stderr,
+            )
+            return 1 if args.strict else 0
+        print(f"\n[SUMMARY] all {len(themes)} themes succeeded")
+        return 0
+
     if not args.theme:
-        print("[ERROR] theme is required (or use --test-markdown / --search)", file=sys.stderr)
+        print(
+            "[ERROR] theme is required "
+            "(or use --themes-file / --test-markdown / --search)",
+            file=sys.stderr,
+        )
         return 2
 
     return await run_research(args.theme, args.max_pages)
@@ -535,6 +637,18 @@ def main() -> int:
     ap.add_argument(
         "--test-markdown", default=None,
         help="fetch one URL and dump markdown / chunks (no embed, no upsert)",
+    )
+    ap.add_argument(
+        "--themes-file", default=None,
+        help="path to themes file (1 theme per line, # for comments)",
+    )
+    ap.add_argument(
+        "--lock-file", default="/tmp/web_research.lock",
+        help="lock file path for multi-instance prevention (themes-file mode)",
+    )
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="themes-file mode: stop on first failure (default: continue)",
     )
     args = ap.parse_args()
     return asyncio.run(amain(args))

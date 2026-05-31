@@ -1,0 +1,8 @@
+# Phase 2.1b sample themes
+# 1 line = 1 theme; blank lines and lines starting with # are skipped.
+# Edit this file to customize the daily research themes.
+# Duplicates (case-insensitive) are detected and warned at parse time.
+
+Python asyncio best practices
+FastAPI dependency injection patterns
+Kubernetes pod security standards
