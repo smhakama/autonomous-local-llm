@@ -92,6 +92,18 @@ directly by Aider, browser-use, or any future agent. Step 5 assumes the
 
 ## Distillation pipeline (Phase 3)
 
+> **Naming note.** A separate public project also called **Corpus2Skill**
+> ([dukesun99/Corpus2Skill](https://github.com/dukesun99/Corpus2Skill),
+> Sun et al. 2026) shares the name but solves a different problem: it
+> distils a corpus into an
+> [Anthropic Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)
+> navigation tree (`.claude/skills/SKILL.md` + `INDEX.md`) so an LLM agent
+> can traverse the hierarchy at serve time without a vector store. This
+> repo's `corpus2skill.py` instead produces an importable Python module
+> (`skills/<theme>.py`) from theme-tagged Qdrant chunks. The two outputs
+> are complementary — Markdown navigation tree for Claude Code, Python
+> module for Aider / browser-use.
+
 `corpus2skill.py` is the main Phase 3 entry point. Given a theme (e.g.
 `asyncio`, `kubernetes`), it pulls the matching chunks out of the
 `web_brain_clean` Qdrant collection (populated upstream by the Phase 2.5
