@@ -23,6 +23,10 @@ After=default.target
 [Service]
 Type=oneshot
 WorkingDirectory=__REPO__
+# WSL2: nvidia-smi lives under /usr/lib/wsl/lib, which the interactive shell
+# auto-adds but the systemd user service does not. Without this the bench
+# fails instantly at the baseline VRAM probe.
+Environment=PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=__REPO__/cron/llm_nightly_experiment.sh
 # stdout/stderr already redirected to $LLM_NIGHTLY_LOG by the shell script,
 # so we keep journald output minimal.
