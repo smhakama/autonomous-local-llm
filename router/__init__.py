@@ -18,6 +18,9 @@ mechanical):
       build_router_record, append_router_record          (router._metrics)
     - DEFAULT_CRITIC_HINT_MAX_LINES,
       format_critic_hint                                 (router.strategies, Phase 3.8c)
+    - CRITIC_REVIEW_PROMPT_TEMPLATE,
+      build_critic_review_prompt,
+      SequentialCriticReviewStrategy                     (router.strategies, Phase 3.8c+)
 """
 
 from ._metrics import (
@@ -28,11 +31,14 @@ from ._metrics import (
 from .runners import ModelOutput, ModelRunner, OllamaRunner
 from .strategies import (
     CRITIC_PROMPT_TEMPLATE,
+    CRITIC_REVIEW_PROMPT_TEMPLATE,
     DEFAULT_CRITIC_HINT_MAX_LINES,
     AsymmetricDebateStrategy,
     RouterResult,
     RouterStrategy,
+    SequentialCriticReviewStrategy,
     build_critic_prompt,
+    build_critic_review_prompt,
     format_critic_hint,
     parse_critic_findings,
 )
@@ -40,6 +46,7 @@ from .strategies import (
 __all__ = [
     "AsymmetricDebateStrategy",
     "CRITIC_PROMPT_TEMPLATE",
+    "CRITIC_REVIEW_PROMPT_TEMPLATE",
     "DEFAULT_CRITIC_HINT_MAX_LINES",
     "ModelOutput",
     "ModelRunner",
@@ -47,8 +54,10 @@ __all__ = [
     "ROUTER_SCHEMA_VERSION",
     "RouterResult",
     "RouterStrategy",
+    "SequentialCriticReviewStrategy",
     "append_router_record",
     "build_critic_prompt",
+    "build_critic_review_prompt",
     "build_router_record",
     "format_critic_hint",
     "parse_critic_findings",

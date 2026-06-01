@@ -1,16 +1,23 @@
-"""Phase 3.8b: router strategies.
+"""Phase 3.8b/3.8c+: router strategies.
 
-PoC #1 = ``AsymmetricDebateStrategy`` — parallel proposer + critic that
-both receive the *same chunks* (no proposer-output dependency on critic
-side) and run concurrently via threading. Wall ≈ ``max(proposer_total,
-critic_total)`` because Phase 3.8a measured ``wall_vs_total_max ≈ 1.000``
-under the NT6 configuration.
+PoC #1 = ``AsymmetricDebateStrategy`` (Phase 3.8b) — parallel proposer
++ critic that both receive the *same chunks* (no proposer-output
+dependency on critic side) and run concurrently via threading.
+Wall ≈ ``max(proposer_total, critic_total)`` because Phase 3.8a measured
+``wall_vs_total_max ≈ 1.000`` under the NT6 configuration.
 
 The merge step is intentionally minimal in this PoC: ``chosen_text`` is
 the proposer output; the critic output is parsed into a list of findings
-and recorded in metrics so a later phase (3.8c) can decide whether to
-feed findings back as a retry hint. Keeping the merge dumb here lets us
-measure critic *signal* in isolation before adding feedback complexity.
+and recorded in metrics. Phase 3.8c then feeds those findings back into
+proposer retry prompts via ``format_critic_hint``.
+
+PoC #2 = ``SequentialCriticReviewStrategy`` (Phase 3.8c+) — proposer
+runs *first*, then a critic re-runs on (chunks + proposer's code) so
+findings actually critique the produced module rather than the source
+docs in the abstract. Wall ≈ ``proposer_total + critic_total`` (sequential
+by construction; the parallel benefit is traded for per-attempt fresh
+feedback). Used when Phase 3.8c smoke shows ``every-attempt`` mode with
+chunks-only critic produces near-identical findings each iteration.
 """
 
 from __future__ import annotations
@@ -175,6 +182,104 @@ class AsymmetricDebateStrategy:
         critic_out = outputs["critic"]
         assert proposer_out is not None
         assert critic_out is not None
+
+        return RouterResult(
+            strategy_name=self.name,
+            proposer_output=proposer_out,
+            critic_output=critic_out,
+            chosen_text=proposer_out.text,
+            critic_findings=parse_critic_findings(critic_out.text),
+            parallel_wall_sec=wall,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+
+
+# -------------------------------------------------------------------------
+# Phase 3.8c+: SequentialCriticReviewStrategy
+# -------------------------------------------------------------------------
+#
+# Phase 3.8c smoke proved that a chunks-only critic with a stable prompt
+# converges to near-identical findings each iteration (top 2 bullets verbatim
+# match across 3 modes). The fix is to let the critic actually see what the
+# proposer produced and review *that code* against the chunks. Trade-off:
+# lose Phase 3.8b's parallel-wall benefit (now wall ≈ proposer + critic
+# instead of max), gain genuinely fresh per-attempt feedback.
+
+
+CRITIC_REVIEW_PROMPT_TEMPLATE = """You are a code-skill critic reviewing a Python module that another LLM (the proposer) just wrote about "{theme}". You have the same {n_chunks} Markdown chunks the proposer saw, AND the proposer's actual code output. Review the code against the chunks.
+
+Your task: identify concrete issues in the proposer's code — hallucinated APIs that don't appear in the chunks, off-by-one logic, mis-implemented invariants, mishandled edge cases, deprecated symbols, or claims the chunks do not support. Cite specific function names or line content from the code. Do NOT rewrite the code. Do NOT critique the chunks in the abstract; critique THIS module.
+
+Output format: ONE issue per line, prefixed with "- ", short and specific. 5 to 15 lines. No preamble. No closing summary.
+
+--- BEGIN CHUNKS ---
+{joined_chunks}
+--- END CHUNKS ---
+
+--- BEGIN PROPOSER CODE ---
+{proposer_code}
+--- END PROPOSER CODE ---
+
+Output the issue list now:"""
+
+
+def build_critic_review_prompt(
+    *,
+    theme: str,
+    n_chunks: int,
+    joined_chunks: str,
+    proposer_code: str,
+) -> str:
+    """Format ``CRITIC_REVIEW_PROMPT_TEMPLATE`` with the proposer's code.
+
+    The proposer code is injected verbatim so the critic can refer to
+    specific function names / lines. No truncation is applied here — if
+    the proposer emits a 50KB module, the caller is responsible for
+    deciding whether to clip first (out of scope for the strategy).
+    """
+    return CRITIC_REVIEW_PROMPT_TEMPLATE.format(
+        theme=theme,
+        n_chunks=n_chunks,
+        joined_chunks=joined_chunks,
+        proposer_code=proposer_code,
+    )
+
+
+@dataclass(frozen=True)
+class SequentialCriticReviewStrategy:
+    """Run proposer first, then critic on (chunks + proposer's code).
+
+    Sequential by construction: critic input depends on proposer output,
+    so no parallelism is possible. The ``parallel_wall_sec`` field on
+    ``RouterResult`` records the *total sequential wall* here, not a true
+    parallel wall — readers should disambiguate via ``strategy_name``.
+
+    On proposer failure the critic is NOT invoked: a failed proposer
+    leaves nothing meaningful to review, and we want fast-fail semantics
+    so the outer retry loop can move on.
+    """
+
+    name: str = "sequential_critic_review"
+
+    def route(
+        self,
+        *,
+        proposer_prompt: str,
+        critic_prompt_template: str,
+        proposer: ModelRunner,
+        critic: ModelRunner,
+        options: dict[str, Any] | None = None,
+    ) -> RouterResult:
+        started_at = datetime.now(timezone.utc).isoformat()
+        t_start = time.monotonic()
+        proposer_out = proposer.generate(proposer_prompt, options=options)
+        critic_prompt = critic_prompt_template.format(
+            proposer_code=proposer_out.text
+        )
+        critic_out = critic.generate(critic_prompt, options=options)
+        wall = time.monotonic() - t_start
+        finished_at = datetime.now(timezone.utc).isoformat()
 
         return RouterResult(
             strategy_name=self.name,

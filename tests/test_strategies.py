@@ -10,7 +10,7 @@ runner finish before the other starts, which we also catch via the
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -20,7 +20,9 @@ from router.strategies import (
     DEFAULT_CRITIC_HINT_MAX_LINES,
     AsymmetricDebateStrategy,
     RouterResult,
+    SequentialCriticReviewStrategy,
     build_critic_prompt,
+    build_critic_review_prompt,
     format_critic_hint,
     parse_critic_findings,
 )
@@ -313,3 +315,222 @@ def test_asymmetric_debate_propagates_critic_error() -> None:
             proposer=proposer,
             critic=critic,  # type: ignore[arg-type]
         )
+
+
+# -------------------------------------------------------------------------
+# SequentialCriticReviewStrategy (Phase 3.8c+)
+# -------------------------------------------------------------------------
+
+
+def test_critic_review_prompt_template_substitutes_all_fields() -> None:
+    p = build_critic_review_prompt(
+        theme="asyncio",
+        n_chunks=2,
+        joined_chunks="--- chunk body ---",
+        proposer_code="def helper():\n    pass\n",
+    )
+    assert "asyncio" in p
+    assert "2 Markdown" in p
+    assert "--- chunk body ---" in p
+    assert "def helper():" in p
+    # Anchor markers separate the two payloads so the LLM cannot confuse
+    # docs vs. produced code.
+    assert "--- BEGIN PROPOSER CODE ---" in p
+    assert "--- END PROPOSER CODE ---" in p
+    assert "Output the issue list now" in p
+
+
+@dataclass
+class RecordingRunner:
+    """FakeRunner variant that captures *every* prompt it receives.
+
+    The sequential strategy mutates the critic prompt between proposer
+    and critic, so the test needs to inspect what the critic actually
+    saw (not just the template).
+    """
+
+    role: str
+    model_id: str
+    sleep_sec: float = 0.0
+    return_text: str = ""
+    received_prompts: list[str] = field(default_factory=list)
+    started_at: float | None = None
+    finished_at: float | None = None
+
+    def generate(
+        self, prompt: str, *, options: dict[str, Any] | None = None
+    ) -> ModelOutput:
+        self.received_prompts.append(prompt)
+        self.started_at = time.monotonic()
+        if self.sleep_sec > 0:
+            time.sleep(self.sleep_sec)
+        self.finished_at = time.monotonic()
+        return ModelOutput(
+            text=self.return_text,
+            role=self.role,
+            model_id=self.model_id,
+            prompt_eval_count=10,
+            eval_count=100,
+            eval_duration_ns=int(self.sleep_sec * 1e9),
+            prompt_eval_duration_ns=0,
+            total_duration_ns=int(self.sleep_sec * 1e9),
+            load_duration_ns=0,
+        )
+
+
+def test_sequential_critic_review_runs_proposer_before_critic() -> None:
+    """Ordering invariant: critic must observe proposer.finished_at <=
+    its own started_at — i.e., critic cannot start before proposer
+    finishes (the whole point of going sequential)."""
+    proposer = RecordingRunner(
+        role="proposer", model_id="p:1", sleep_sec=0.2,
+        return_text="def f(): pass",
+    )
+    critic = RecordingRunner(
+        role="critic", model_id="c:1", sleep_sec=0.2,
+        return_text="- issue 1",
+    )
+    SequentialCriticReviewStrategy().route(
+        proposer_prompt="prop",
+        critic_prompt_template="review:\n{proposer_code}",
+        proposer=proposer,  # type: ignore[arg-type]
+        critic=critic,  # type: ignore[arg-type]
+    )
+    assert proposer.started_at is not None
+    assert proposer.finished_at is not None
+    assert critic.started_at is not None
+    # critic.started_at must be on or after proposer.finished_at
+    assert critic.started_at >= proposer.finished_at
+
+
+def test_sequential_critic_review_wall_equals_sum_not_max() -> None:
+    """Sequential semantics: wall ≈ sum(proposer, critic), not max.
+
+    Each runner sleeps 0.2 s; total wall must be at least 0.4 s. A
+    parallel implementation would clock in around 0.2 s, so a comfortable
+    margin (0.35 s) catches accidental parallelism.
+    """
+    proposer = RecordingRunner(
+        role="proposer", model_id="p:1", sleep_sec=0.2, return_text="x"
+    )
+    critic = RecordingRunner(
+        role="critic", model_id="c:1", sleep_sec=0.2, return_text="- x"
+    )
+    t0 = time.monotonic()
+    result = SequentialCriticReviewStrategy().route(
+        proposer_prompt="prop",
+        critic_prompt_template="review:\n{proposer_code}",
+        proposer=proposer,  # type: ignore[arg-type]
+        critic=critic,  # type: ignore[arg-type]
+    )
+    wall = time.monotonic() - t0
+    assert wall >= 0.35, f"wall {wall:.3f}s suggests parallel execution"
+    # The strategy's own reported wall should match observed wall within 50 ms.
+    assert abs(result.parallel_wall_sec - wall) < 0.05
+
+
+def test_sequential_critic_review_injects_proposer_output_into_critic_prompt() -> None:
+    """The critic must see the proposer's actual code in its prompt."""
+    proposer_code = "def reusable_helper():\n    return 42"
+    proposer = RecordingRunner(
+        role="proposer", model_id="p:1", return_text=proposer_code
+    )
+    critic = RecordingRunner(
+        role="critic", model_id="c:1", return_text="- looks fine"
+    )
+    template = (
+        "Review the following code:\n--- CODE ---\n"
+        "{proposer_code}\n--- END ---"
+    )
+    SequentialCriticReviewStrategy().route(
+        proposer_prompt="distill this",
+        critic_prompt_template=template,
+        proposer=proposer,  # type: ignore[arg-type]
+        critic=critic,  # type: ignore[arg-type]
+    )
+    # Proposer saw only its own prompt, no critic-template leakage.
+    assert proposer.received_prompts == ["distill this"]
+    # Critic saw the substituted template with proposer's actual output.
+    assert len(critic.received_prompts) == 1
+    critic_prompt_seen = critic.received_prompts[0]
+    assert "def reusable_helper():" in critic_prompt_seen
+    assert "return 42" in critic_prompt_seen
+    assert "Review the following code" in critic_prompt_seen
+
+
+def test_sequential_critic_review_returns_router_result_with_findings() -> None:
+    """Structural check on RouterResult, including parsed findings."""
+    proposer = RecordingRunner(
+        role="proposer", model_id="deepseek-r1:14b",
+        return_text="def f(): pass",
+    )
+    critic_text = (
+        "- hallucinated `os.walkdir` (should be `os.walk`)\n"
+        "- off-by-one in deque slicing on line 12\n"
+        "- missing import for `Path`\n"
+    )
+    critic = RecordingRunner(
+        role="critic", model_id="gemma2:9b-instruct-q4_K_M",
+        return_text=critic_text,
+    )
+    result = SequentialCriticReviewStrategy().route(
+        proposer_prompt="p",
+        critic_prompt_template="t:{proposer_code}",
+        proposer=proposer,  # type: ignore[arg-type]
+        critic=critic,  # type: ignore[arg-type]
+    )
+    assert isinstance(result, RouterResult)
+    assert result.strategy_name == "sequential_critic_review"
+    assert result.chosen_text == "def f(): pass"
+    assert result.proposer_output.model_id == "deepseek-r1:14b"
+    assert result.critic_output.model_id == "gemma2:9b-instruct-q4_K_M"
+    assert result.critic_findings == (
+        "hallucinated `os.walkdir` (should be `os.walk`)",
+        "off-by-one in deque slicing on line 12",
+        "missing import for `Path`",
+    )
+
+
+def test_sequential_critic_review_skips_critic_on_proposer_failure() -> None:
+    """If the proposer raises, the critic is NOT called and the error
+    propagates. Sequential semantics — there is nothing to review."""
+
+    @dataclass
+    class FailingRunner:
+        role: str
+        model_id: str
+
+        def generate(
+            self, prompt: str, *, options: dict[str, Any] | None = None
+        ) -> ModelOutput:
+            raise RuntimeError("proposer boom")
+
+    critic_called = {"n": 0}
+
+    @dataclass
+    class WatchingCritic:
+        role: str = "critic"
+        model_id: str = "c:1"
+
+        def generate(
+            self, prompt: str, *, options: dict[str, Any] | None = None
+        ) -> ModelOutput:
+            critic_called["n"] += 1
+            return ModelOutput(
+                text="never reached", role=self.role, model_id=self.model_id,
+                prompt_eval_count=0, eval_count=0,
+                eval_duration_ns=0, prompt_eval_duration_ns=0,
+                total_duration_ns=0, load_duration_ns=0,
+            )
+
+    proposer = FailingRunner(role="proposer", model_id="p:1")
+    critic = WatchingCritic()
+
+    with pytest.raises(RuntimeError, match="proposer boom"):
+        SequentialCriticReviewStrategy().route(
+            proposer_prompt="x",
+            critic_prompt_template="y:{proposer_code}",
+            proposer=proposer,  # type: ignore[arg-type]
+            critic=critic,  # type: ignore[arg-type]
+        )
+    assert critic_called["n"] == 0, "critic must not run after proposer failure"
