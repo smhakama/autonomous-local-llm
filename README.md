@@ -155,6 +155,82 @@ Use `--prompt-mode long` (the current default) for any decision-grade
 measurement; `--prompt-mode short` exists only to reproduce the Phase 3.7c
 artifact.
 
+## Router / multi-model team (Phase 3.8b)
+
+Phase 3.8b introduces a new `router/` subpackage that orchestrates two models
+running in parallel on the same chunks. The first concrete strategy —
+`AsymmetricDebateStrategy` — fires a *proposer* (`deepseek-r1:14b` on GPU) and
+an independent *critic* (`gemma2:9b-instruct-q4_K_M` with `num_gpu=0`)
+concurrently, leveraging the Phase 3.8a NT6 verdict
+(`options.num_thread=6` for both, sum_conc 9.39 tok/s, wall ≈ max of both totals).
+
+The PoC merge step is intentionally dumb: `chosen_text = proposer.text`; the
+critic output is parsed into bullet findings and recorded in
+`metrics/router_runs.jsonl` (schema v1) for offline analysis. The goal is to
+measure *critic signal* in isolation before adding any feedback loop (Phase 3.8c).
+
+Opt in per run via `--router-strategy asymmetric_debate`:
+
+```bash
+python corpus2skill.py \
+  --theme "Kubernetes pod security standards" \
+  --router-strategy asymmetric_debate
+```
+
+Default behaviour is `--router-strategy none`: the legacy single-`call_14b`
+code path is preserved verbatim. The router fires only on the first attempt
+(`attempt == 1`); subsequent retries (corrective hint, 7B fallback,
+RAG-adaptive) stay on the single primary model — the critic exists to give an
+*initial independent view*, not retry-hint refinement.
+
+### Smoke run (Phase 3.8b, kubernetes, commit a74ef4d)
+
+Real-world end-to-end smoke against fresh `web_brain_clean` (2 cleansed
+chunks from `kubernetes.io` pod security standards docs):
+
+| Metric | Value |
+|---|---|
+| `parallel_wall_sec` | 197.96 |
+| proposer `total_duration` | 197.34 s |
+| critic `total_duration`  | 194.78 s |
+| `wall_vs_total_max` ratio | 1.003 (Phase 3.8a pattern reproduced live) |
+| proposer `eval_count` | 1009 tokens |
+| critic `eval_count`   | 158 tokens |
+| `critic_findings_count` | 8 |
+
+Sample of the critic's findings (gemma2:9b reading only the source chunks,
+not the proposer's output):
+
+- *"Hallucinating methods or attributes for Kubernetes objects based on incomplete documentation."*
+- *"Confusing the allowed values for sysctls with a whitelist, potentially missing edge cases."*
+- *"Overlooking the distinction between `audit`, `warn`, and `enforce` modes, resulting in inappropriate behavior."*
+
+These are kubernetes-specific pitfalls about the actual semantics of the
+Pod Security Standards API — useful signal that the existing Gemini L5 critic
+(which audits the *generated module*, Phase 3.2) does not produce because it
+never sees the source docs.
+
+### Schema bump (`distill_runs.jsonl` v2 → v3)
+
+`metrics/distill_runs.jsonl` now carries `router_strategy`, `router_wall_sec`,
+and `router_critic_findings_count` (all null when the router did not fire),
+plus the router CLI knobs in the `config` snapshot. The change is additive
+and nullable, so v2 parsers continue to work on v3 records.
+
+The router itself is wired behind a narrow `ModelRunner` Protocol so the
+backend can be swapped (Ollama → vLLM → a remote API) by writing one new
+class. The Phase 3.8a parallel-capacity verdict pins the runner defaults
+(`num_thread=6`, critic `num_gpu=0`); revisit those when the underlying
+hardware changes.
+
+### Qdrant note (2026-06-01 incident)
+
+Phase 3.8b's smoke setup found that Docker Desktop on WSL2 silently overlays
+bind mounts to `/home/<user>/...` with `tmpfs`, so Qdrant restarts wipe all
+collections without warning. The repository now ships a `docker-compose.yml`
+that uses a Docker *named volume* (`qdrant_data`) instead of a bind mount;
+bring Qdrant up with `docker compose up -d`.
+
 ## Verified configuration
 
 ### Ollama-via-Aider

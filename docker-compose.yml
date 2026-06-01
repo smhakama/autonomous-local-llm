@@ -1,0 +1,26 @@
+# Phase 3.8b: Qdrant + (existing SearxNG sidecar) via docker-compose.
+#
+# 元の `docker run` ベースの bind-mount 構成は Docker Desktop + WSL2 環境で
+# `/home/<user>/...` を tmpfs に overlay してしまう既知不具合に遭遇した
+# (2026-06-01 確認、container 内 mount table が `none on /qdrant/storage type
+# tmpfs` を返す)。named volume `qdrant_data` で Docker Desktop の仮想ディスク
+# に格納させて回避する。
+#
+# 既存の bind-mount 配下 (/home/makoto/qdrant_storage) は触らず温存。データ
+# 復旧が必要になったら named volume にコピーする運用。
+services:
+  qdrant:
+    # `:latest` を pin する代わりにローカル cache 済 tag を採用 (2026-06-01 時点 v1.18.1)。
+    # 公式 dockerhub では v1.18.1 タグが見当たらず、:latest を採用するのが現実解。
+    # アップグレードは手動で `docker compose pull` してから up -d。
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
