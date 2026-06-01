@@ -62,6 +62,10 @@ MAX_RETRIES = 3
 
 # --- Phase 3.2 quality-loop 定数 ---
 DEFAULT_QUALITY_MAX_RETRIES = 2  # 品質ループの retry 回数 (L1-L3 retry とは別カウント)
+# Phase 3.8c++ E0: corpus size 制御。default 50 で fetch_chunks_by_theme の
+# 元シグネチャと完全後方互換。harder corpus 検証 (raw web_brain で num_ctx
+# overflow 抑制) や軽量 smoke 用途では `--chunks-limit N` で絞り込む。
+DEFAULT_CHUNKS_LIMIT = 50
 DEFAULT_MYPY_BIN = "mypy"
 DEFAULT_ASK_GEMINI_BIN = "ask_gemini"
 DEFAULT_GEMINI_REVIEW_TIMEOUT = 90  # full skill review は時間がかかる
@@ -1068,6 +1072,7 @@ def distill(
     critic_model: str = DEFAULT_CRITIC_MODEL,
     router_metrics_file: Path | None = None,
     router_feedback: str = DEFAULT_ROUTER_FEEDBACK,
+    chunks_limit: int = DEFAULT_CHUNKS_LIMIT,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -1091,7 +1096,7 @@ def distill(
             f"got {router_feedback!r}"
         )
     qd = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    chunks = fetch_chunks_by_theme(qd, collection, theme)
+    chunks = fetch_chunks_by_theme(qd, collection, theme, limit=chunks_limit)
     if not chunks:
         return DistillResult(
             theme=theme, n_chunks=0, source_urls=(), raw_response="",
@@ -1621,6 +1626,16 @@ def main() -> int:
         help=f"品質ループの retry 回数 (default {DEFAULT_QUALITY_MAX_RETRIES})",
     )
     ap.add_argument(
+        "--chunks-limit", type=int, default=DEFAULT_CHUNKS_LIMIT,
+        help=(
+            f"Qdrant scroll で取得する chunks の上限 (default {DEFAULT_CHUNKS_LIMIT})。"
+            "raw web_brain など chunks 数が多い collection で num_ctx overflow を抑制、"
+            "または harder corpus 検証で size を deliberate に制御する用途 (Phase 3.8c++ E0)。"
+            "1 以上必須、0 以下は fetch_chunks_by_theme で空 list 返却の罠を避けるため"
+            "argparse 段階で reject。"
+        ),
+    )
+    ap.add_argument(
         "--mypy-bin", default=DEFAULT_MYPY_BIN,
         help=f"mypy バイナリ名 (default {DEFAULT_MYPY_BIN!r}、不在時 graceful skip)",
     )
@@ -1810,6 +1825,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.chunks_limit < 1:
+        print(
+            f"[ERROR] --chunks-limit は 1 以上必須 (got {args.chunks_limit})、"
+            "0 以下は Qdrant scroll が空 list を返す罠を避けるため reject",
+            file=sys.stderr,
+        )
+        return 2
 
     # Phase 3.8b: router_metrics_file は --no-router-metrics で None 化
     router_metrics_path: Path | None = (
@@ -1840,6 +1862,7 @@ def main() -> int:
         critic_model=args.critic_model,
         router_metrics_file=router_metrics_path,
         router_feedback=args.router_feedback,
+        chunks_limit=args.chunks_limit,
     )
 
     # Phase 3.7: metrics JSONL 書出し (成功/失敗どちらも記録、--no-metrics で無効化)。

@@ -275,6 +275,29 @@ def test_default_router_metrics_file_constant() -> None:
     assert DEFAULT_ROUTER_METRICS_FILE == "metrics/router_runs.jsonl"
 
 
+def test_cli_chunks_limit_advertised_and_validated() -> None:
+    """Phase 3.8c++ E0: --chunks-limit flag exposed with default 50 and
+    argparse rejects 0/negative values for safety (Qdrant scroll with
+    limit<1 returns empty without error, masking config bugs)."""
+    help_proc = _run_corpus(["--help"])
+    assert help_proc.returncode == 0, help_proc.stderr
+    assert "--chunks-limit" in help_proc.stdout
+    assert "default 50" in help_proc.stdout
+
+    # 0 must be rejected with non-zero exit
+    zero_proc = _run_corpus(
+        ["--theme", "dummy", "--chunks-limit", "0"]
+    )
+    assert zero_proc.returncode == 2
+    assert "1 以上必須" in zero_proc.stderr or "1 以上" in zero_proc.stderr
+
+    # Negative also rejected
+    neg_proc = _run_corpus(
+        ["--theme", "dummy", "--chunks-limit", "-3"]
+    )
+    assert neg_proc.returncode == 2
+
+
 # -------------------------------------------------------------------------
 # _run_asymmetric_debate — runner shape + metrics writer integration
 # -------------------------------------------------------------------------
