@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 3.7c / 3.7e-1: Parallel capacity benchmark.
+"""Phase 3.7c / 3.7e-1 / 3.7e-2: Parallel capacity benchmark.
 
 Measures whether gemma2:9b (CPU only, num_gpu=0) and deepseek-r1:14b (default
 GPU partial offload) can coexist under 8GB VRAM / 15GB RAM, and the throughput
@@ -15,6 +15,14 @@ Phase 3.7e-1 (schema v2):
   - wall_vs_total_max_ratio = wall / max(gemma.total_duration, deepseek.total_duration).
     ≈ 1.0 means wall is bounded by the slower model's total_duration (no
     queue overhead). > 1.0 means thread/queue overhead beyond Ollama-internal.
+
+Phase 3.7e-2 (schema v3): C vs D hypothesis split.
+  - --num-thread N: pass options.num_thread to both models (None=Ollama default).
+  - --mem-stress: run stress-ng --vm 2 --vm-bytes 1G --vm-keep alongside the
+    concurrent measurement to add RAM-bandwidth pressure (proxy for hypothesis D).
+  - --bind-cores-label: free-form label recorded in config (actual taskset of
+    `ollama serve` is done outside via systemd override; the script only labels).
+  - --config-id: free-form matrix tag (e.g. E0, E1, E3, E4) attached to record.
 
 Sequence:
   1. baseline VRAM/RAM
@@ -67,9 +75,12 @@ LONG_NUM_PREDICT = 300
 
 WARMUP_NUM_PREDICT = 10
 DEFAULT_RUNS = 3
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_METRICS_FILE = PROJECT_ROOT / "metrics" / "parallel_capacity_checks.jsonl"
+
+STRESS_NG_VM_INSTANCES = 2
+STRESS_NG_VM_BYTES = "1G"
 
 
 def nvidia_smi_vram_used_mb() -> int:
@@ -94,11 +105,17 @@ def ram_used_mb() -> int:
 
 
 def ollama_generate(
-    model: str, prompt: str, num_predict: int, num_gpu: int | None
+    model: str,
+    prompt: str,
+    num_predict: int,
+    num_gpu: int | None,
+    num_thread: int | None = None,
 ) -> dict[str, Any]:
     options: dict[str, Any] = {"num_predict": num_predict, "temperature": 0.1}
     if num_gpu is not None:
         options["num_gpu"] = num_gpu
+    if num_thread is not None:
+        options["num_thread"] = num_thread
     payload = {"model": model, "prompt": prompt, "stream": False, "options": options}
     r = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=600)
     r.raise_for_status()
@@ -156,17 +173,22 @@ class RunStats:
         return asdict(self)
 
 
-def warmup(model: str, num_gpu: int | None) -> None:
-    print(f"  warmup {model} (num_gpu={num_gpu})...", flush=True)
-    ollama_generate(model, "Hello", WARMUP_NUM_PREDICT, num_gpu)
+def warmup(model: str, num_gpu: int | None, num_thread: int | None = None) -> None:
+    print(f"  warmup {model} (num_gpu={num_gpu}, num_thread={num_thread})...", flush=True)
+    ollama_generate(model, "Hello", WARMUP_NUM_PREDICT, num_gpu, num_thread)
 
 
 def measure_solo(
-    model: str, num_gpu: int | None, runs: int, prompt: str, num_predict: int
+    model: str,
+    num_gpu: int | None,
+    runs: int,
+    prompt: str,
+    num_predict: int,
+    num_thread: int | None = None,
 ) -> list[RunStats]:
     results: list[RunStats] = []
     for i in range(runs):
-        resp = ollama_generate(model, prompt, num_predict, num_gpu)
+        resp = ollama_generate(model, prompt, num_predict, num_gpu, num_thread)
         stats = RunStats.from_response(resp)
         results.append(stats)
         print(
@@ -181,7 +203,7 @@ def measure_solo(
 
 
 def measure_concurrent(
-    runs: int, prompt: str, num_predict: int
+    runs: int, prompt: str, num_predict: int, num_thread: int | None = None
 ) -> tuple[list[RunStats], list[RunStats], list[float]]:
     gemma_results: list[RunStats] = []
     deepseek_results: list[RunStats] = []
@@ -190,11 +212,13 @@ def measure_concurrent(
         results: dict[str, dict | None] = {"gemma": None, "deepseek": None}
 
         def call_gemma() -> None:
-            results["gemma"] = ollama_generate(GEMMA, prompt, num_predict, num_gpu=0)
+            results["gemma"] = ollama_generate(
+                GEMMA, prompt, num_predict, num_gpu=0, num_thread=num_thread
+            )
 
         def call_deepseek() -> None:
             results["deepseek"] = ollama_generate(
-                DEEPSEEK, prompt, num_predict, num_gpu=None
+                DEEPSEEK, prompt, num_predict, num_gpu=None, num_thread=num_thread
             )
 
         t_start = time.monotonic()
@@ -236,6 +260,51 @@ def safe_ratio(num: float, den: float) -> float | None:
     return (num / den) if den > 0 else None
 
 
+def stress_ng_version() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["stress-ng", "--version"], text=True, stderr=subprocess.STDOUT
+        )
+        return out.strip().splitlines()[0]
+    except Exception:
+        return None
+
+
+def start_mem_stress() -> subprocess.Popen | None:
+    """Phase 3.7e-2 D-hypothesis proxy: launch stress-ng vm load.
+
+    Returns Popen so caller can terminate in finally block. Returns None and
+    prints a warning if stress-ng is unavailable.
+    """
+    if not stress_ng_version():
+        print("  [warn] stress-ng not found; --mem-stress is a no-op", flush=True)
+        return None
+    cmd = [
+        "stress-ng",
+        "--vm",
+        str(STRESS_NG_VM_INSTANCES),
+        "--vm-bytes",
+        STRESS_NG_VM_BYTES,
+        "--vm-keep",
+    ]
+    print(f"  starting mem stress: {' '.join(cmd)}", flush=True)
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_mem_stress(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    print("  terminating mem stress", flush=True)
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception as exc:  # pragma: no cover
+        print(f"  [warn] stress-ng cleanup failed: {exc}", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
@@ -247,6 +316,32 @@ def main() -> int:
         default="long",
         help="short = Phase 3.7c reproducer (early-EOS, ~4 tokens); "
         "long (default) = ~800-char English prompt with num_predict=300",
+    )
+    ap.add_argument(
+        "--num-thread",
+        type=int,
+        default=None,
+        help="Phase 3.7e-2: options.num_thread for both models "
+        "(None = Ollama default). Used to test hypothesis C (SMT contention).",
+    )
+    ap.add_argument(
+        "--mem-stress",
+        action="store_true",
+        help="Phase 3.7e-2: run stress-ng --vm 2 --vm-bytes 1G --vm-keep "
+        "alongside concurrent measurement (hypothesis D: RAM bandwidth).",
+    )
+    ap.add_argument(
+        "--bind-cores-label",
+        type=str,
+        default=None,
+        help="Phase 3.7e-2: free-form label recorded in config. Actual taskset "
+        "of `ollama serve` is done outside via systemd override.",
+    )
+    ap.add_argument(
+        "--config-id",
+        type=str,
+        default=None,
+        help="Phase 3.7e-2: free-form matrix tag (e.g. E0, E1, E3, E4).",
     )
     args = ap.parse_args()
 
@@ -265,7 +360,7 @@ def main() -> int:
     print(f"  vram={baseline_vram}MB ram={baseline_ram}MB load={loadavg()}")
 
     print(f"\n[2/8] {GEMMA} load (num_gpu=0) + warmup")
-    warmup(GEMMA, num_gpu=0)
+    warmup(GEMMA, num_gpu=0, num_thread=args.num_thread)
     gemma_only_vram = nvidia_smi_vram_used_mb()
     gemma_only_ram = ram_used_mb()
     print(
@@ -280,7 +375,7 @@ def main() -> int:
     print(f"  loaded after unload: {loaded_after_unload}")
 
     print(f"\n[4/8] {DEEPSEEK} load + warmup")
-    warmup(DEEPSEEK, num_gpu=None)
+    warmup(DEEPSEEK, num_gpu=None, num_thread=args.num_thread)
     deepseek_only_vram = nvidia_smi_vram_used_mb()
     deepseek_only_ram = ram_used_mb()
     print(
@@ -289,7 +384,7 @@ def main() -> int:
     )
 
     print(f"\n[5/8] {GEMMA} re-load (both should coexist)")
-    warmup(GEMMA, num_gpu=0)
+    warmup(GEMMA, num_gpu=0, num_thread=args.num_thread)
     loaded = [m["name"] for m in ollama_loaded()]
     both_vram = nvidia_smi_vram_used_mb()
     both_ram = ram_used_mb()
@@ -305,17 +400,36 @@ def main() -> int:
     )
     print("  -- gemma solo --")
     gemma_solo = measure_solo(
-        GEMMA, num_gpu=0, runs=args.runs, prompt=prompt, num_predict=num_predict
+        GEMMA,
+        num_gpu=0,
+        runs=args.runs,
+        prompt=prompt,
+        num_predict=num_predict,
+        num_thread=args.num_thread,
     )
     print("  -- deepseek solo --")
     deepseek_solo = measure_solo(
-        DEEPSEEK, num_gpu=None, runs=args.runs, prompt=prompt, num_predict=num_predict
+        DEEPSEEK,
+        num_gpu=None,
+        runs=args.runs,
+        prompt=prompt,
+        num_predict=num_predict,
+        num_thread=args.num_thread,
     )
 
     print(f"\n[7/8] concurrent throughput x{args.runs}")
-    gemma_concurrent, deepseek_concurrent, wall_concurrent = measure_concurrent(
-        args.runs, prompt=prompt, num_predict=num_predict
-    )
+    stress_proc: subprocess.Popen | None = None
+    try:
+        if args.mem_stress:
+            stress_proc = start_mem_stress()
+        gemma_concurrent, deepseek_concurrent, wall_concurrent = measure_concurrent(
+            args.runs,
+            prompt=prompt,
+            num_predict=num_predict,
+            num_thread=args.num_thread,
+        )
+    finally:
+        stop_mem_stress(stress_proc)
 
     duration = time.monotonic() - t0
     finished_at = datetime.now(timezone.utc)
@@ -416,6 +530,13 @@ def main() -> int:
             "gemma_num_gpu": 0,
             "deepseek_num_gpu": None,
             "temperature": 0.1,
+            "num_thread": args.num_thread,
+            "mem_stress": bool(args.mem_stress),
+            "bind_cores_label": args.bind_cores_label,
+            "config_id": args.config_id,
+        },
+        "system": {
+            "stress_ng_version": stress_ng_version() if args.mem_stress else None,
         },
         "meta": {
             "started_at": started_at.isoformat(),
