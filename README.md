@@ -254,6 +254,41 @@ is ~6.27 tok/s — close to the measured 6.84). Phase 3.7e-2 (`schema v3`)
 adds a `num_thread` / `mem-stress` matrix to separate the two hypotheses
 formally.
 
+### Phase 3.7e-2 matrix verdict (5 configs, n=3 each, long prompt)
+
+| cfg | num_thread | bind | g_intf | d_intf | wall (s) |
+|---|---|---|---|---|---|
+| E0 (baseline) | server default | — | 0.604 | 0.517 | 89.5 |
+| **E1** | 6 | — | **0.729** | **0.700** | **75.8** |
+| E2 | 24 | — | 0.071 | 0.048 | 577.8 |
+| E3 | 6 | taskset `0-11` | 0.687 | 0.642 | 83.9 |
+| E4 | 6 | — (`stress-ng --vm 2 --vm-bytes 1G`) | 0.638 | 0.607 | 90.0 |
+
+The matrix isolates two effects:
+
+- **Primary: SMT over-subscription (hypothesis C).** Capping `options.num_thread`
+  at 6 (E1) lifts both interference ratios by 21–35 % and cuts wall by 15 %
+  versus the server default. Pushing it to 24 (E2) collapses throughput;
+  even *solo* gemma drops from 5.7 → 3.2 tok/s and `wall_vs_total_max_ratio`
+  falls to 0.33, meaning the kernel scheduler is no longer overlapping the
+  two requests.
+- **Secondary: RAM bandwidth (hypothesis D).** A 2 GB working-set
+  `stress-ng --vm` background load (E4) costs about 13 % of the
+  interference-ratio gain. Real, but small compared to E2.
+
+The systemd `taskset -c 0-11` drop-in (E3) actually *hurt* throughput here.
+WSL2 hides the underlying CCD topology from the guest, so binding vCPUs 0–11
+does not translate into pinning to one CCD or to physical-core siblings, and
+the Hyper-V SMT-aware scheduler ends up working against the affinity mask.
+On bare-metal Linux on a Ryzen with exposed CCDs the verdict could flip;
+under WSL2 it does not.
+
+**Practical takeaway for this environment** (Ryzen 9 3900 12C24T, WSL2,
+15 GB guest RAM): set `options.num_thread=6` for the CPU-only second model
+and leave Ollama's affinity to the kernel default. Do not add a
+`taskset` drop-in. Re-run the matrix on hardware where the CCD topology is
+visible to the OS before extrapolating.
+
 ### Other notes
 
 End-to-end Aider edits via `qwen2.5-coder:7b` add roughly **8 s of
