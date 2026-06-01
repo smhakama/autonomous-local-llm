@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""Phase 3.7c: Parallel capacity benchmark.
+"""Phase 3.7c / 3.7e-1: Parallel capacity benchmark.
 
 Measures whether gemma2:9b (CPU only, num_gpu=0) and deepseek-r1:14b (default
 GPU partial offload) can coexist under 8GB VRAM / 15GB RAM, and the throughput
 penalty when both are queried in parallel. One JSONL record appended to
 metrics/parallel_capacity_checks.jsonl.
+
+Phase 3.7e-1 (schema v2):
+  - Records per-run RunStats (eval_count, prompt_eval_count, *_duration_ns)
+    so interference can be separated from early-EOS (Phase 3.7c short prompt
+    finished with eval_count=4 — wall was dominated by load + prompt_eval).
+  - --prompt-mode {short,long}; long uses a ~800-char English prompt with
+    num_predict=300 to keep the measurement window > early-EOS.
+  - wall_vs_total_max_ratio = wall / max(gemma.total_duration, deepseek.total_duration).
+    ≈ 1.0 means wall is bounded by the slower model's total_duration (no
+    queue overhead). > 1.0 means thread/queue overhead beyond Ollama-internal.
 
 Sequence:
   1. baseline VRAM/RAM
@@ -27,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,11 +47,27 @@ import requests
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_API_BASE", "http://127.0.0.1:11434")
 GEMMA = "gemma2:9b-instruct-q4_K_M"
 DEEPSEEK = "deepseek-r1:14b"
-PROMPT = "What is the capital of Japan? Answer in one word."
-NUM_PREDICT = 50
+
+SHORT_PROMPT = "What is the capital of Japan? Answer in one word."
+SHORT_NUM_PREDICT = 50
+LONG_PROMPT = (
+    "Explain in detail what a large language model is, how it is trained, "
+    "and how it differs from earlier statistical language models. Cover the "
+    "transformer architecture, the role of self-attention, the distinction "
+    "between pre-training and fine-tuning, the role of reinforcement learning "
+    "from human feedback, common evaluation benchmarks such as MMLU and "
+    "HumanEval, and the engineering challenges of scaling parameter counts "
+    "from millions to hundreds of billions. Discuss the trade-offs between "
+    "model size, inference cost, latency, and quality, and explain why "
+    "smaller specialised models are sometimes preferred over larger general "
+    "ones. Finish with a short paragraph on open-weight models and their "
+    "impact on local inference."
+)
+LONG_NUM_PREDICT = 300
+
 WARMUP_NUM_PREDICT = 10
 DEFAULT_RUNS = 3
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_METRICS_FILE = PROJECT_ROOT / "metrics" / "parallel_capacity_checks.jsonl"
 
@@ -93,12 +120,40 @@ def ollama_unload(model: str) -> None:
     )
 
 
-def tps(resp: dict | None) -> float:
-    if not resp:
-        return 0.0
-    ec = resp.get("eval_count", 0)
-    ed = resp.get("eval_duration", 0)  # ns
-    return (ec / (ed / 1e9)) if ec and ed else 0.0
+@dataclass(frozen=True)
+class RunStats:
+    """Phase 3.7e-1 schema v2: full Ollama /api/generate timing record.
+
+    eval_tps is derived from eval_count / eval_duration_s, matching Phase 3.7c
+    semantics. Use total_duration_ns when comparing against concurrent wall.
+    """
+
+    eval_count: int
+    prompt_eval_count: int
+    eval_duration_ns: int
+    prompt_eval_duration_ns: int
+    total_duration_ns: int
+    load_duration_ns: int
+    eval_tps: float
+
+    @staticmethod
+    def from_response(resp: dict[str, Any] | None) -> "RunStats":
+        if not resp:
+            return RunStats(0, 0, 0, 0, 0, 0, 0.0)
+        ec = int(resp.get("eval_count", 0) or 0)
+        ed = int(resp.get("eval_duration", 0) or 0)
+        return RunStats(
+            eval_count=ec,
+            prompt_eval_count=int(resp.get("prompt_eval_count", 0) or 0),
+            eval_duration_ns=ed,
+            prompt_eval_duration_ns=int(resp.get("prompt_eval_duration", 0) or 0),
+            total_duration_ns=int(resp.get("total_duration", 0) or 0),
+            load_duration_ns=int(resp.get("load_duration", 0) or 0),
+            eval_tps=(ec / (ed / 1e9)) if ec and ed else 0.0,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def warmup(model: str, num_gpu: int | None) -> None:
@@ -106,28 +161,40 @@ def warmup(model: str, num_gpu: int | None) -> None:
     ollama_generate(model, "Hello", WARMUP_NUM_PREDICT, num_gpu)
 
 
-def measure_solo(model: str, num_gpu: int | None, runs: int) -> list[float]:
-    results: list[float] = []
+def measure_solo(
+    model: str, num_gpu: int | None, runs: int, prompt: str, num_predict: int
+) -> list[RunStats]:
+    results: list[RunStats] = []
     for i in range(runs):
-        resp = ollama_generate(model, PROMPT, NUM_PREDICT, num_gpu)
-        results.append(tps(resp))
-        print(f"  {model} solo run {i + 1}/{runs}: {results[-1]:.2f} t/s", flush=True)
+        resp = ollama_generate(model, prompt, num_predict, num_gpu)
+        stats = RunStats.from_response(resp)
+        results.append(stats)
+        print(
+            f"  {model} solo run {i + 1}/{runs}: "
+            f"ec={stats.eval_count} "
+            f"tps={stats.eval_tps:.2f} "
+            f"pec={stats.prompt_eval_count} "
+            f"total={stats.total_duration_ns / 1e9:.2f}s",
+            flush=True,
+        )
     return results
 
 
-def measure_concurrent(runs: int) -> tuple[list[float], list[float], list[float]]:
-    gemma_results: list[float] = []
-    deepseek_results: list[float] = []
+def measure_concurrent(
+    runs: int, prompt: str, num_predict: int
+) -> tuple[list[RunStats], list[RunStats], list[float]]:
+    gemma_results: list[RunStats] = []
+    deepseek_results: list[RunStats] = []
     wall_results: list[float] = []
     for i in range(runs):
         results: dict[str, dict | None] = {"gemma": None, "deepseek": None}
 
         def call_gemma() -> None:
-            results["gemma"] = ollama_generate(GEMMA, PROMPT, NUM_PREDICT, num_gpu=0)
+            results["gemma"] = ollama_generate(GEMMA, prompt, num_predict, num_gpu=0)
 
         def call_deepseek() -> None:
             results["deepseek"] = ollama_generate(
-                DEEPSEEK, PROMPT, NUM_PREDICT, num_gpu=None
+                DEEPSEEK, prompt, num_predict, num_gpu=None
             )
 
         t_start = time.monotonic()
@@ -139,14 +206,16 @@ def measure_concurrent(runs: int) -> tuple[list[float], list[float], list[float]
         t2.join()
         wall = time.monotonic() - t_start
 
-        gtps = tps(results["gemma"])
-        dtps = tps(results["deepseek"])
-        gemma_results.append(gtps)
-        deepseek_results.append(dtps)
+        gstats = RunStats.from_response(results["gemma"])
+        dstats = RunStats.from_response(results["deepseek"])
+        gemma_results.append(gstats)
+        deepseek_results.append(dstats)
         wall_results.append(wall)
         print(
-            f"  concurrent run {i + 1}/{runs}: gemma {gtps:.2f}, "
-            f"deepseek {dtps:.2f} t/s, wall {wall:.2f}s",
+            f"  concurrent run {i + 1}/{runs}: "
+            f"gemma tps={gstats.eval_tps:.2f} ec={gstats.eval_count}, "
+            f"deepseek tps={dstats.eval_tps:.2f} ec={dstats.eval_count}, "
+            f"wall {wall:.2f}s",
             flush=True,
         )
     return gemma_results, deepseek_results, wall_results
@@ -172,7 +241,19 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--metrics-file", type=Path, default=DEFAULT_METRICS_FILE)
     ap.add_argument("--dry-run", action="store_true", help="skip JSONL write")
+    ap.add_argument(
+        "--prompt-mode",
+        choices=["short", "long"],
+        default="long",
+        help="short = Phase 3.7c reproducer (early-EOS, ~4 tokens); "
+        "long (default) = ~800-char English prompt with num_predict=300",
+    )
     args = ap.parse_args()
+
+    if args.prompt_mode == "long":
+        prompt, num_predict = LONG_PROMPT, LONG_NUM_PREDICT
+    else:
+        prompt, num_predict = SHORT_PROMPT, SHORT_NUM_PREDICT
 
     started_at = datetime.now(timezone.utc)
     t0 = time.monotonic()
@@ -218,27 +299,54 @@ def main() -> int:
         f"(Δfrom_deepseek_only={both_vram - deepseek_only_vram}MB)"
     )
 
-    print(f"\n[6/8] solo throughput x{args.runs}")
+    print(
+        f"\n[6/8] solo throughput x{args.runs} "
+        f"(mode={args.prompt_mode}, num_predict={num_predict})"
+    )
     print("  -- gemma solo --")
-    gemma_solo = measure_solo(GEMMA, num_gpu=0, runs=args.runs)
+    gemma_solo = measure_solo(
+        GEMMA, num_gpu=0, runs=args.runs, prompt=prompt, num_predict=num_predict
+    )
     print("  -- deepseek solo --")
-    deepseek_solo = measure_solo(DEEPSEEK, num_gpu=None, runs=args.runs)
+    deepseek_solo = measure_solo(
+        DEEPSEEK, num_gpu=None, runs=args.runs, prompt=prompt, num_predict=num_predict
+    )
 
     print(f"\n[7/8] concurrent throughput x{args.runs}")
-    gemma_concurrent, deepseek_concurrent, wall_concurrent = measure_concurrent(args.runs)
+    gemma_concurrent, deepseek_concurrent, wall_concurrent = measure_concurrent(
+        args.runs, prompt=prompt, num_predict=num_predict
+    )
 
     duration = time.monotonic() - t0
     finished_at = datetime.now(timezone.utc)
     print(f"\n[8/8] writing JSONL ({duration:.1f}s total elapsed)")
 
-    gemma_solo_avg = statistics.fmean(gemma_solo) if gemma_solo else 0.0
-    deepseek_solo_avg = statistics.fmean(deepseek_solo) if deepseek_solo else 0.0
+    gemma_solo_tps = [s.eval_tps for s in gemma_solo]
+    deepseek_solo_tps = [s.eval_tps for s in deepseek_solo]
+    gemma_concurrent_tps = [s.eval_tps for s in gemma_concurrent]
+    deepseek_concurrent_tps = [s.eval_tps for s in deepseek_concurrent]
+    gemma_solo_avg = statistics.fmean(gemma_solo_tps) if gemma_solo_tps else 0.0
+    deepseek_solo_avg = (
+        statistics.fmean(deepseek_solo_tps) if deepseek_solo_tps else 0.0
+    )
     gemma_concurrent_avg = (
-        statistics.fmean(gemma_concurrent) if gemma_concurrent else 0.0
+        statistics.fmean(gemma_concurrent_tps) if gemma_concurrent_tps else 0.0
     )
     deepseek_concurrent_avg = (
-        statistics.fmean(deepseek_concurrent) if deepseek_concurrent else 0.0
+        statistics.fmean(deepseek_concurrent_tps) if deepseek_concurrent_tps else 0.0
     )
+
+    # Phase 3.7e-1: wall vs max(total_duration) ratio per concurrent run.
+    # ≈ 1.0  → wall is bounded by the slower model's total_duration (no extra queue overhead)
+    # > 1.0  → thread/queue overhead beyond Ollama-internal max
+    concurrent_total_max_ms: list[float] = []
+    wall_vs_total_max: list[float] = []
+    for g, d, wall_s in zip(gemma_concurrent, deepseek_concurrent, wall_concurrent):
+        max_total_ns = max(g.total_duration_ns, d.total_duration_ns)
+        concurrent_total_max_ms.append(round(max_total_ns / 1e6, 3))
+        wall_vs_total_max.append(
+            round(wall_s / (max_total_ns / 1e9), 4) if max_total_ns > 0 else 0.0
+        )
 
     record = {
         "theme": "parallel_capacity_check",
@@ -260,11 +368,21 @@ def main() -> int:
             "both_loaded": both_ram,
         },
         "throughput_tps": {
-            "gemma_solo": gemma_solo,
-            "deepseek_solo": deepseek_solo,
-            "gemma_concurrent": gemma_concurrent,
-            "deepseek_concurrent": deepseek_concurrent,
+            "gemma_solo": gemma_solo_tps,
+            "deepseek_solo": deepseek_solo_tps,
+            "gemma_concurrent": gemma_concurrent_tps,
+            "deepseek_concurrent": deepseek_concurrent_tps,
         },
+        "solo_stats": {
+            "gemma": [s.to_dict() for s in gemma_solo],
+            "deepseek": [s.to_dict() for s in deepseek_solo],
+        },
+        "concurrent_stats": {
+            "gemma": [s.to_dict() for s in gemma_concurrent],
+            "deepseek": [s.to_dict() for s in deepseek_concurrent],
+        },
+        "concurrent_total_duration_max_ms": concurrent_total_max_ms,
+        "wall_vs_total_max_ratio": wall_vs_total_max,
         "throughput_avg_tps": {
             "gemma_solo_avg": round(gemma_solo_avg, 3),
             "deepseek_solo_avg": round(deepseek_solo_avg, 3),
@@ -285,8 +403,10 @@ def main() -> int:
         "concurrent_wall_sec": [round(w, 3) for w in wall_concurrent],
         "cpu_loadavg_final": loadavg(),
         "config": {
-            "prompt": PROMPT,
-            "num_predict": NUM_PREDICT,
+            "prompt_mode": args.prompt_mode,
+            "prompt": prompt,
+            "prompt_length_chars": len(prompt),
+            "num_predict": num_predict,
             "warmup_num_predict": WARMUP_NUM_PREDICT,
             "runs_per_phase": args.runs,
             "ollama_base_url": OLLAMA_BASE_URL,
