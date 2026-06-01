@@ -42,8 +42,10 @@ from router import (
     AsymmetricDebateStrategy,
     OllamaRunner,
     RouterResult,
+    SequentialCriticReviewStrategy,
     append_router_record,
     build_critic_prompt,
+    build_critic_review_prompt,
     build_router_record,
     format_critic_hint,
 )
@@ -123,11 +125,16 @@ PRIMARY_MODEL = DEFAULT_MODEL
 DEFAULT_FALLBACK_MODEL = "qwen2.5-coder:7b"
 DEFAULT_ENABLE_FALLBACK = False
 
-# --- Phase 3.8b router/critic 定数 ---
+# --- Phase 3.8b/3.8c+ router/critic 定数 ---
 # router_strategy="none" で従来挙動 (single primary model 呼出) を完全保持。
-# "asymmetric_debate" で初回 attempt のみ proposer (primary) + critic を並列実行し、
-# critic findings は router_runs.jsonl に記録、code 採用は proposer 出力 (PoC)。
+# "asymmetric_debate" (Phase 3.8b)        — proposer + critic を chunks 上で並列実行、
+#                                            wall ≈ max(proposer, critic)、critic は code 未閲覧。
+# "sequential_critic_review" (Phase 3.8c+) — proposer 完了後 critic が (chunks + proposer
+#                                            の今回出力 code) を review。逐次、wall ≈ 合計。
+#                                            Phase 3.8c smoke の「chunks-only critic は毎回
+#                                            ≈ 同 findings」問題への解。
 DEFAULT_ROUTER_STRATEGY = "none"
+ROUTER_STRATEGY_CHOICES = ("none", "asymmetric_debate", "sequential_critic_review")
 DEFAULT_CRITIC_MODEL = "gemma2:9b-instruct-q4_K_M"
 DEFAULT_ROUTER_METRICS_FILE = "metrics/router_runs.jsonl"
 # Phase 3.8a NT6 verdict 固定値 — 半年先の再評価で別 sweet spot が出るまで固定。
@@ -889,6 +896,95 @@ def _run_asymmetric_debate(
     return result
 
 
+def _run_sequential_critic_review(
+    *,
+    theme: str,
+    chunks: list[dict],
+    proposer_prompt: str,
+    proposer_model: str,
+    critic_model: str,
+    timeout: int,
+    router_metrics_file: Path | None,
+) -> RouterResult:
+    """proposer 完了後に critic を (chunks + proposer の今回出力 code) で発火し、
+    router_runs.jsonl に 1 record 追記する。
+
+    Phase 3.8c+ PoC #2: critic prompt を template として渡し、strategy 内で
+    proposer.text を substitution する。逐次なので wall ≈ proposer + critic、
+    交換条件として critic が code-level の specific findings を返す (Phase
+    3.8c smoke で「chunks-only critic は毎回 ≈ 同 findings」を観測したため)。
+    """
+    critic_prompt_template = build_critic_review_prompt(
+        theme=theme,
+        n_chunks=len(chunks),
+        joined_chunks=_join_chunks_for_critic(chunks),
+        proposer_code="{proposer_code}",  # strategy 内で substitution される sentinel
+    )
+    # NT6 verdict (Phase 3.8a): num_thread=6 が並列 sum_conc 最大スイートスポット。
+    # 逐次でも CPU thread 設定は同一に揃え、benchmark 横並びを保つ。
+    proposer_runner = OllamaRunner(
+        role="proposer",
+        model_id=proposer_model,
+        timeout_sec=float(timeout),
+        default_options={"num_thread": ROUTER_NUM_THREAD, "num_predict": NUM_PREDICT},
+    )
+    critic_runner = OllamaRunner(
+        role="critic",
+        model_id=critic_model,
+        timeout_sec=float(timeout),
+        default_options={
+            "num_thread": ROUTER_NUM_THREAD,
+            "num_gpu": 0,
+            "num_predict": NUM_PREDICT,
+            "temperature": 0.1,
+        },
+    )
+    print(
+        f"      [router] sequential_critic_review: proposer={proposer_model!r} (GPU) → "
+        f"critic={critic_model!r} (CPU only, num_gpu=0)、num_thread={ROUTER_NUM_THREAD}"
+    )
+    result = SequentialCriticReviewStrategy().route(
+        proposer_prompt=proposer_prompt,
+        critic_prompt_template=critic_prompt_template,
+        proposer=proposer_runner,
+        critic=critic_runner,
+    )
+    print(
+        f"      [router] wall={result.parallel_wall_sec:.1f}s "
+        f"proposer_eval={result.proposer_output.eval_count} "
+        f"critic_eval={result.critic_output.eval_count} "
+        f"findings={len(result.critic_findings)} (sequential)"
+    )
+    if router_metrics_file is not None:
+        rec = build_router_record(
+            result=result,
+            theme=theme,
+            options={
+                "num_thread": ROUTER_NUM_THREAD,
+                "num_predict": NUM_PREDICT,
+                "critic_num_gpu": 0,
+                "proposer_model": proposer_model,
+                "critic_model": critic_model,
+                # Phase 3.8c+: sequential execution は wall semantics 違うので mark。
+                "execution_mode": "sequential",
+            },
+            repo_dir=Path(__file__).resolve().parent,
+        )
+        try:
+            append_router_record(router_metrics_file, rec)
+            print(
+                f"      [router] appended to {router_metrics_file}",
+                file=sys.stderr,
+            )
+        except OSError as e:
+            print(
+                f"      [WARN] router_runs.jsonl 書出し失敗 ({router_metrics_file}): {e}、"
+                "distill は継続",
+                file=sys.stderr,
+            )
+    return result
+
+
 def quality_check(
     skill_path: Path,
     *,
@@ -1094,13 +1190,23 @@ def distill(
         # Phase 3.8b 互換: feedback='none' のとき attempt==1 のみ router (legacy)。
         # Phase 3.8c on-retry: attempt==1 のみ router、findings は次以降の inject へ。
         # Phase 3.8c every-attempt: 全 attempt で router 稼働、findings 毎回 refresh。
+        # Phase 3.8c+: 'sequential_critic_review' は dispatch helper を切替、
+        # 起動 attempt の判定 (attempt 1 or every-attempt) ロジックは共通。
         router_runs_this_attempt = (
-            router_strategy == "asymmetric_debate"
+            router_strategy in ("asymmetric_debate", "sequential_critic_review")
             and (attempt == 1 or router_feedback == "every-attempt")
         )
         if router_runs_this_attempt:
+            if router_strategy == "asymmetric_debate":
+                _router_helper = _run_asymmetric_debate
+            elif router_strategy == "sequential_critic_review":
+                _router_helper = _run_sequential_critic_review
+            else:  # 防御的: choices で弾かれるので到達しない
+                raise RuntimeError(
+                    f"unhandled router_strategy {router_strategy!r}"
+                )
             try:
-                router_result = _run_asymmetric_debate(
+                router_result = _router_helper(
                     theme=theme,
                     chunks=chunks,
                     proposer_prompt=effective_prompt,
@@ -1605,16 +1711,19 @@ def main() -> int:
         "--no-metrics", action="store_true",
         help="metrics JSONL 書出しを skip (Phase 3.7)",
     )
-    # --- Phase 3.8b router/critic 引数 ---
+    # --- Phase 3.8b/3.8c+ router/critic 引数 ---
     ap.add_argument(
         "--router-strategy",
-        choices=["none", "asymmetric_debate"],
+        choices=list(ROUTER_STRATEGY_CHOICES),
         default=DEFAULT_ROUTER_STRATEGY,
         help=(
             f"multi-model orchestration strategy (default {DEFAULT_ROUTER_STRATEGY!r}、"
-            "Phase 3.8b)。'asymmetric_debate' で初回 attempt のみ proposer (primary "
-            "model) + critic を並列実行 (Phase 3.8a NT6 verdict 利用)、critic findings "
-            "は router_runs.jsonl に記録のみ (PoC、merge は Phase 3.8c)。"
+            "Phase 3.8b/3.8c+)。'asymmetric_debate' (Phase 3.8b) で proposer + critic を "
+            "chunks 上で並列実行 (wall ≈ max)、critic は code 未閲覧。"
+            "'sequential_critic_review' (Phase 3.8c+) で proposer 完了後 critic が "
+            "(chunks + proposer の今回出力 code) を review (wall ≈ 合計)、code-level "
+            "の specific findings を得る (Phase 3.8c smoke 結果への解)。"
+            "起動 attempt は --router-feedback で制御。"
         ),
     )
     ap.add_argument(

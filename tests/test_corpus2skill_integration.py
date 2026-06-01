@@ -34,9 +34,11 @@ from corpus2skill import (
     MODEL_REGISTRY,
     ROUTER_FEEDBACK_CHOICES,
     ROUTER_NUM_THREAD,
+    ROUTER_STRATEGY_CHOICES,
     DistillResult,
     _build_metrics_record,
     _run_asymmetric_debate,
+    _run_sequential_critic_review,
 )
 
 
@@ -227,13 +229,22 @@ def test_cli_help_advertises_all_router_flags() -> None:
     assert proc.returncode == 0, proc.stderr
     text = proc.stdout
     assert "--router-strategy" in text
-    assert "{none,asymmetric_debate}" in text
+    # Phase 3.8c+: choices expand to 3 (none, asymmetric_debate, sequential_critic_review).
+    assert "none" in text and "asymmetric_debate" in text
+    assert "sequential_critic_review" in text
     assert "--critic-model" in text
     assert "--router-metrics-file" in text
     assert "--no-router-metrics" in text
     # Phase 3.8c: --router-feedback flag with 3 choices.
     assert "--router-feedback" in text
     assert "{none,on-retry,every-attempt}" in text
+
+
+def test_router_strategy_choices_constant() -> None:
+    """Phase 3.8c+: source-of-truth tuple — single edit point on next add."""
+    assert ROUTER_STRATEGY_CHOICES == (
+        "none", "asymmetric_debate", "sequential_critic_review",
+    )
 
 
 def test_cli_rejects_unknown_router_feedback() -> None:
@@ -641,3 +652,97 @@ def test_router_feedback_every_attempt_refreshes_findings_each_call(
     # DistillResult: 2 injection events (attempts 2 + 3)
     assert result.router_feedback_mode == "every-attempt"
     assert result.router_findings_injected_count == 2
+
+
+# -------------------------------------------------------------------------
+# Phase 3.8c+: _run_sequential_critic_review — dispatch + record + ordering
+# -------------------------------------------------------------------------
+
+
+def test_run_sequential_critic_review_writes_router_record(tmp_path: Path) -> None:
+    """End-to-end: sequential helper builds the right runner shape, writes a
+    record marked with execution_mode='sequential', and produces a
+    RouterResult whose strategy_name disambiguates from asymmetric_debate."""
+    target = tmp_path / "router_runs.jsonl"
+    chunks = [
+        {"url": "https://example.invalid/a", "heading_path": "Intro", "text": "alpha"},
+        {"url": "https://example.invalid/b", "heading_path": "Refs", "text": "beta"},
+    ]
+    fake_post = _route_by_model({
+        "deepseek-r1:14b": _OLLAMA_RESPONSE_PROPOSER,
+        DEFAULT_CRITIC_MODEL: _OLLAMA_RESPONSE_CRITIC,
+    })
+
+    with patch("router.runners.requests.post", side_effect=fake_post):
+        result = _run_sequential_critic_review(
+            theme="kubernetes",
+            chunks=chunks,
+            proposer_prompt="distill this",
+            proposer_model="deepseek-r1:14b",
+            critic_model=DEFAULT_CRITIC_MODEL,
+            timeout=600,
+            router_metrics_file=target,
+        )
+
+    assert result.strategy_name == "sequential_critic_review"
+    assert result.proposer_output.model_id == "deepseek-r1:14b"
+    assert result.critic_output.model_id == DEFAULT_CRITIC_MODEL
+    assert result.chosen_text.startswith("```python")
+    # 3 bullets in _OLLAMA_RESPONSE_CRITIC → all parsed
+    assert result.critic_findings == ("pitfall A", "pitfall B", "pitfall C")
+
+    assert target.exists()
+    rec = json.loads(target.read_text(encoding="utf-8").strip())
+    assert rec["strategy_name"] == "sequential_critic_review"
+    assert rec["theme"] == "kubernetes"
+    assert rec["critic_findings_count"] == 3
+    # Sequential execution is flagged in the options snapshot.
+    assert rec["options"]["execution_mode"] == "sequential"
+    assert rec["options"]["num_thread"] == ROUTER_NUM_THREAD
+    assert rec["options"]["critic_num_gpu"] == 0
+
+
+def test_run_sequential_critic_review_injects_proposer_output_into_critic_prompt(
+    tmp_path: Path,
+) -> None:
+    """The whole point of Phase 3.8c+: the critic must see the proposer's
+    actual code in its prompt. Captures the per-model request bodies and
+    verifies that the critic's prompt contains the proposer's response
+    body verbatim."""
+    chunks = [{"url": "u", "heading_path": "h", "text": "t"}]
+    captured: list[dict] = []
+
+    def capturing_post(url: str, *, json: dict, timeout: float) -> MagicMock:  # noqa: A002
+        captured.append(json)
+        return _make_mock_response(
+            _OLLAMA_RESPONSE_PROPOSER
+            if json["model"] == "deepseek-r1:14b"
+            else _OLLAMA_RESPONSE_CRITIC
+        )
+
+    with patch("router.runners.requests.post", side_effect=capturing_post):
+        _run_sequential_critic_review(
+            theme="x",
+            chunks=chunks,
+            proposer_prompt="p",
+            proposer_model="deepseek-r1:14b",
+            critic_model=DEFAULT_CRITIC_MODEL,
+            timeout=600,
+            router_metrics_file=None,
+        )
+
+    # Exactly 2 calls: proposer first, critic second (sequential ordering).
+    assert len(captured) == 2
+    assert captured[0]["model"] == "deepseek-r1:14b"
+    assert captured[1]["model"] == DEFAULT_CRITIC_MODEL
+    # The proposer's response code block must appear inside the critic's
+    # prompt — this is the Phase 3.8c+ raison d'être.
+    proposer_response_text = _OLLAMA_RESPONSE_PROPOSER["response"]
+    critic_prompt = captured[1]["prompt"]
+    assert "def helper():" in critic_prompt
+    assert "BEGIN PROPOSER CODE" in critic_prompt
+    assert "END PROPOSER CODE" in critic_prompt
+    # Proposer code body (after stripping markdown fences) should appear in critic prompt
+    assert proposer_response_text in critic_prompt
+    # critic must still receive options with num_gpu=0 (CPU-only).
+    assert captured[1]["options"]["num_gpu"] == 0
