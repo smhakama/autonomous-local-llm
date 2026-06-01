@@ -36,6 +36,17 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+# Phase 3.8b: 多モデルルーター (proposer + critic 並列)。default "none" 経路では
+# import するだけで未使用なので副作用ゼロ、後方互換。
+from router import (
+    AsymmetricDebateStrategy,
+    OllamaRunner,
+    RouterResult,
+    append_router_record,
+    build_critic_prompt,
+    build_router_record,
+)
+
 OLLAMA_URL = "http://127.0.0.1:11434"
 QDRANT_HOST = "127.0.0.1"
 QDRANT_PORT = 6333
@@ -94,6 +105,14 @@ MODEL_REGISTRY: dict[str, dict[str, str | int]] = {
         "size_gb": 5,
         "notes": "未評価",
     },
+    "gemma2:9b-instruct-q4_K_M": {
+        "role": "critic",
+        "size_gb": 6,
+        "notes": (
+            "CPU only 推奨 (num_gpu=0)、Phase 3.8a で 8GB VRAM 環境の並列パートナーとして検証済 "
+            "(NT6 sum_conc 9.39 tps)、日本語 9B 分水嶺、Phase 3.8b critic default"
+        ),
+    },
 }
 # 旧 DEFAULT_MODEL の意味的 alias (将来差替え時の単一変更点)
 PRIMARY_MODEL = DEFAULT_MODEL
@@ -102,6 +121,16 @@ PRIMARY_MODEL = DEFAULT_MODEL
 # default OFF で完全後方互換、`--enable-7b-fallback` で opt-in。
 DEFAULT_FALLBACK_MODEL = "qwen2.5-coder:7b"
 DEFAULT_ENABLE_FALLBACK = False
+
+# --- Phase 3.8b router/critic 定数 ---
+# router_strategy="none" で従来挙動 (single primary model 呼出) を完全保持。
+# "asymmetric_debate" で初回 attempt のみ proposer (primary) + critic を並列実行し、
+# critic findings は router_runs.jsonl に記録、code 採用は proposer 出力 (PoC)。
+DEFAULT_ROUTER_STRATEGY = "none"
+DEFAULT_CRITIC_MODEL = "gemma2:9b-instruct-q4_K_M"
+DEFAULT_ROUTER_METRICS_FILE = "metrics/router_runs.jsonl"
+# Phase 3.8a NT6 verdict 固定値 — 半年先の再評価で別 sweet spot が出るまで固定。
+ROUTER_NUM_THREAD = 6
 
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
@@ -180,6 +209,12 @@ class DistillResult:
     # Phase 3.6: inner retry 最終段で 7B fallback が発火したときの model 名 (例
     # 'qwen2.5-coder:7b')。未発火または --enable-7b-fallback OFF は None。
     fallback_model_used: str | None = None
+    # Phase 3.8b: router strategy が初回 attempt で稼働したときの metadata。
+    # router_strategy=None かつ wall_sec/findings_count=None で従来挙動 (single
+    # model 呼出) を区別。
+    router_strategy: str | None = None
+    router_wall_sec: float | None = None
+    router_critic_findings_count: int | None = None
 
 
 def fetch_chunks_by_theme(
@@ -570,7 +605,9 @@ def gemini_review(
 # raw_response / extracted_code は冗長 (skill_path から物理ファイル復元可) のため
 # JSONL では除外し、ファイル肥大化を抑制する。schema 進化は schema_version で管理。
 
-METRICS_SCHEMA_VERSION = 2
+# Phase 3.8b: schema v3 = v2 + DistillResult.router_strategy/wall_sec/critic_findings_count
+# (default None で v2 parser 互換)、config snapshot に router_strategy/critic_model 追加。
+METRICS_SCHEMA_VERSION = 3
 
 
 def _safe_int_subproc(cmd: list[str], timeout: int = 3) -> int | None:
@@ -700,6 +737,10 @@ def _build_metrics_record(
         "collection": args.collection,
         "max_retries": args.max_retries,
         "timeout": args.timeout,
+        # Phase 3.8b: router 設定 snapshot
+        "router_strategy": args.router_strategy,
+        "critic_model": args.critic_model,
+        "router_metrics_file": args.router_metrics_file,
     }
     # 環境メタ
     d["meta"] = {
@@ -731,6 +772,100 @@ def _append_metrics_jsonl(path: Path, record: dict) -> bool:
             file=sys.stderr,
         )
         return False
+
+
+def _join_chunks_for_critic(chunks: list[dict]) -> str:
+    """build_distillation_prompt と同じ join 形式で critic 用 chunks を直列化。"""
+    return "\n\n--- CHUNK SEPARATOR ---\n\n".join(
+        f"### Source: {c.get('url', 'unknown')}\n"
+        f"### Heading: {c.get('heading_path', '')}\n\n"
+        f"{c.get('text', '')}"
+        for c in chunks
+    )
+
+
+def _run_asymmetric_debate(
+    *,
+    theme: str,
+    chunks: list[dict],
+    proposer_prompt: str,
+    proposer_model: str,
+    critic_model: str,
+    timeout: int,
+    router_metrics_file: Path | None,
+) -> RouterResult:
+    """proposer + critic を並列実行し、router_runs.jsonl に 1 record 追記する。
+
+    Phase 3.8b PoC #1: critic は chunks のみを独立評価し、proposer の出力は
+    見ない (完全並列、wall ≈ max(proposer, critic))。chosen_text は proposer
+    出力を採用、critic findings は metrics に記録のみ (next phase で feedback)。
+    """
+    critic_prompt = build_critic_prompt(
+        theme=theme,
+        n_chunks=len(chunks),
+        joined_chunks=_join_chunks_for_critic(chunks),
+    )
+    # NT6 verdict (Phase 3.8a): num_thread=6 が並列 sum_conc 最大スイートスポット。
+    # critic は gemma2:9b で CPU only (num_gpu=0)、proposer は default GPU。
+    proposer_runner = OllamaRunner(
+        role="proposer",
+        model_id=proposer_model,
+        timeout_sec=float(timeout),
+        default_options={"num_thread": ROUTER_NUM_THREAD, "num_predict": NUM_PREDICT},
+    )
+    critic_runner = OllamaRunner(
+        role="critic",
+        model_id=critic_model,
+        timeout_sec=float(timeout),
+        default_options={
+            "num_thread": ROUTER_NUM_THREAD,
+            "num_gpu": 0,
+            "num_predict": NUM_PREDICT,
+            "temperature": 0.1,
+        },
+    )
+    print(
+        f"      [router] asymmetric_debate: proposer={proposer_model!r} (GPU) | "
+        f"critic={critic_model!r} (CPU only, num_gpu=0)、num_thread={ROUTER_NUM_THREAD}"
+    )
+    result = AsymmetricDebateStrategy().route(
+        proposer_prompt=proposer_prompt,
+        critic_prompt=critic_prompt,
+        proposer=proposer_runner,
+        critic=critic_runner,
+    )
+    print(
+        f"      [router] wall={result.parallel_wall_sec:.1f}s "
+        f"proposer_eval={result.proposer_output.eval_count} "
+        f"critic_eval={result.critic_output.eval_count} "
+        f"findings={len(result.critic_findings)}"
+    )
+    if router_metrics_file is not None:
+        rec = build_router_record(
+            result=result,
+            theme=theme,
+            options={
+                "num_thread": ROUTER_NUM_THREAD,
+                "num_predict": NUM_PREDICT,
+                "critic_num_gpu": 0,
+                "proposer_model": proposer_model,
+                "critic_model": critic_model,
+            },
+            repo_dir=Path(__file__).resolve().parent,
+        )
+        try:
+            append_router_record(router_metrics_file, rec)
+            print(
+                f"      [router] appended to {router_metrics_file}",
+                file=sys.stderr,
+            )
+        except OSError as e:
+            print(
+                f"      [WARN] router_runs.jsonl 書出し失敗 ({router_metrics_file}): {e}、"
+                "distill は継続",
+                file=sys.stderr,
+            )
+    return result
 
 
 def quality_check(
@@ -812,6 +947,9 @@ def distill(
     quality_inner_retries: int = DEFAULT_QUALITY_INNER_RETRIES,
     enable_fallback: bool = DEFAULT_ENABLE_FALLBACK,
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
+    router_strategy: str = DEFAULT_ROUTER_STRATEGY,
+    critic_model: str = DEFAULT_CRITIC_MODEL,
+    router_metrics_file: Path | None = None,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -892,6 +1030,11 @@ def distill(
     raw = ""
     code = ""
     attempts = 0
+    # Phase 3.8b: router state、attempt==1 で router_strategy != "none" のとき
+    # のみ書き込まれる。"none" 経路では全て None のまま DistillResult に流れる。
+    router_strategy_used: str | None = None
+    router_wall_sec_used: float | None = None
+    router_findings_count_used: int | None = None
     t0 = time.time()
     for attempt in range(1, max_retries + 1):
         attempts = attempt
@@ -899,12 +1042,37 @@ def distill(
             f"[3/3] attempt {attempt}/{max_retries}: "
             f"distilling via {model} (timeout={timeout}s)..."
         )
-        try:
-            raw = call_14b(prompt, model=model, timeout=timeout)
-        except requests.exceptions.RequestException as e:
-            last_err = f"14B request failed: {type(e).__name__}: {e}"
-            print(f"      [ERROR] {last_err}", file=sys.stderr)
-            continue
+        # Phase 3.8b: 初回 attempt のみ router strategy を稼働。retry は単一 model
+        # で十分 (critic は「最初の独立 view」が PoC の目的、retry hint と無関係)。
+        if attempt == 1 and router_strategy == "asymmetric_debate":
+            try:
+                router_result = _run_asymmetric_debate(
+                    theme=theme,
+                    chunks=chunks,
+                    proposer_prompt=prompt,
+                    proposer_model=model,
+                    critic_model=critic_model,
+                    timeout=timeout,
+                    router_metrics_file=router_metrics_file,
+                )
+            except Exception as e:  # noqa: BLE001 — graceful degrade to single-model retry
+                last_err = f"router failed: {type(e).__name__}: {e}"
+                print(
+                    f"      [WARN] router failed, falling back to single-model: {last_err}",
+                    file=sys.stderr,
+                )
+                continue
+            raw = router_result.chosen_text
+            router_strategy_used = router_result.strategy_name
+            router_wall_sec_used = router_result.parallel_wall_sec
+            router_findings_count_used = len(router_result.critic_findings)
+        else:
+            try:
+                raw = call_14b(prompt, model=model, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                last_err = f"14B request failed: {type(e).__name__}: {e}"
+                print(f"      [ERROR] {last_err}", file=sys.stderr)
+                continue
         cleaned = strip_think(raw)
         candidate = extract_code_block(cleaned)
         if not candidate:
@@ -939,6 +1107,9 @@ def distill(
                 rag_top_k_history=tuple(rag_top_k_history),
                 inner_retry_history=tuple(inner_retry_history),
                 fallback_model_used=fallback_model_used,
+                router_strategy=router_strategy_used,
+                router_wall_sec=router_wall_sec_used,
+                router_critic_findings_count=router_findings_count_used,
             )
 
         # L2: import 検証 (ファイルを実 path に書いて subprocess import)
@@ -976,6 +1147,9 @@ def distill(
                 rag_top_k_history=tuple(rag_top_k_history),
                 inner_retry_history=tuple(inner_retry_history),
                 fallback_model_used=fallback_model_used,
+                router_strategy=router_strategy_used,
+                router_wall_sec=router_wall_sec_used,
+                router_critic_findings_count=router_findings_count_used,
             )
 
         # Phase 3.2 quality loop: L4 (mypy) + L5 (Gemini) を最大 quality_max_retries 回
@@ -1007,6 +1181,9 @@ def distill(
                     rag_top_k_history=tuple(rag_top_k_history),
                     inner_retry_history=tuple(inner_retry_history),
                     fallback_model_used=fallback_model_used,
+                    router_strategy=router_strategy_used,
+                    router_wall_sec=router_wall_sec_used,
+                    router_critic_findings_count=router_findings_count_used,
                 )
             final_feedback = feedback
             if q_attempt >= quality_max_retries:
@@ -1200,6 +1377,9 @@ def distill(
             rag_top_k_history=tuple(rag_top_k_history),
             inner_retry_history=tuple(inner_retry_history),
             fallback_model_used=fallback_model_used,
+            router_strategy=router_strategy_used,
+            router_wall_sec=router_wall_sec_used,
+            router_critic_findings_count=router_findings_count_used,
         )
 
     elapsed = time.time() - t0
@@ -1210,6 +1390,9 @@ def distill(
         rag_top_k_history=tuple(rag_top_k_history),
         inner_retry_history=tuple(inner_retry_history),
         fallback_model_used=fallback_model_used,
+        router_strategy=router_strategy_used,
+        router_wall_sec=router_wall_sec_used,
+        router_critic_findings_count=router_findings_count_used,
     )
 
 
@@ -1352,6 +1535,39 @@ def main() -> int:
         "--no-metrics", action="store_true",
         help="metrics JSONL 書出しを skip (Phase 3.7)",
     )
+    # --- Phase 3.8b router/critic 引数 ---
+    ap.add_argument(
+        "--router-strategy",
+        choices=["none", "asymmetric_debate"],
+        default=DEFAULT_ROUTER_STRATEGY,
+        help=(
+            f"multi-model orchestration strategy (default {DEFAULT_ROUTER_STRATEGY!r}、"
+            "Phase 3.8b)。'asymmetric_debate' で初回 attempt のみ proposer (primary "
+            "model) + critic を並列実行 (Phase 3.8a NT6 verdict 利用)、critic findings "
+            "は router_runs.jsonl に記録のみ (PoC、merge は Phase 3.8c)。"
+        ),
+    )
+    ap.add_argument(
+        "--critic-model",
+        default=DEFAULT_CRITIC_MODEL,
+        help=(
+            f"critic 役の Ollama model (default {DEFAULT_CRITIC_MODEL!r}、"
+            "MODEL_REGISTRY 参照)。CPU only (num_gpu=0) で動かす想定。"
+        ),
+    )
+    ap.add_argument(
+        "--router-metrics-file",
+        default=DEFAULT_ROUTER_METRICS_FILE,
+        help=(
+            f"router 実行の 1 record を append する JSONL パス "
+            f"(default {DEFAULT_ROUTER_METRICS_FILE!r}、Phase 3.8b)。"
+            "--no-router-metrics で書出し抑止。"
+        ),
+    )
+    ap.add_argument(
+        "--no-router-metrics", action="store_true",
+        help="router_runs.jsonl 書出しを skip (Phase 3.8b)",
+    )
     args = ap.parse_args()
 
     # --list-models: registry を表示して即 exit (Phase 3.6)
@@ -1403,6 +1619,10 @@ def main() -> int:
         )
         return 2
 
+    # Phase 3.8b: router_metrics_file は --no-router-metrics で None 化
+    router_metrics_path: Path | None = (
+        None if args.no_router_metrics else Path(args.router_metrics_file)
+    )
     result = distill(
         args.theme,
         collection=args.collection,
@@ -1424,6 +1644,9 @@ def main() -> int:
         quality_inner_retries=args.quality_inner_retries,
         enable_fallback=args.enable_7b_fallback,
         fallback_model=args.fallback_model,
+        router_strategy=args.router_strategy,
+        critic_model=args.critic_model,
+        router_metrics_file=router_metrics_path,
     )
 
     # Phase 3.7: metrics JSONL 書出し (成功/失敗どちらも記録、--no-metrics で無効化)。
