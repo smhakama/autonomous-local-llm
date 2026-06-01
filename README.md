@@ -40,7 +40,7 @@ the active LLM**.
 | `setup_ai_env.sh` | One-shot Rocky 10 WSL2 bootstrap (Ollama + models + Qdrant + venv + Playwright Chromium) |
 | `embed_codebase.py` | PoC: walks a codebase, chunks files, embeds via bge-m3, stores in Qdrant, runs sample semantic searches |
 | `hotfix_loop.py` | Original Phase A→C orchestrator: codebase → 14b plan → Aider 7b edit → pytest → re-plan on failure → commit on green |
-| `corpus2skill.py` | **Phase 3 main pipeline**: theme → web research → cleanse → 14b distill (with 7b fallback) → quality loop → CLAUDE.md-style skill doc + JSONL record |
+| `corpus2skill.py` | **Phase 3 main pipeline**: consumes pre-cleansed Qdrant chunks for a theme → 14b distill (with optional 7b fallback) → quality loop → emits a reusable Python module under `skills/<theme>.py` + a JSONL record |
 | `bench/parallel_capacity_check.py` | Phase 3.7c/e: multi-model coexistence benchmark (gemma2:9b CPU + deepseek-r1:14b GPU), schema v3 with `num_thread` / `mem-stress` matrix knobs |
 | `analyze_runs.py` | Phase 3.7b: pure-stdlib group-by aggregator over `metrics/distill_runs.jsonl` |
 | `metrics/` | Append-only JSONL records — gitignored, intended for offline replay and cross-model comparison |
@@ -82,18 +82,23 @@ Expected outcome of step 4: the orchestrator indexes the repo, asks `deepseek-r1
 for a plan, hands the plan to Aider with `qwen2.5-coder:7b`, runs pytest, and
 commits on green. End-to-end roughly 3 minutes on the reference hardware.
 
-Expected outcome of step 5: a single CLAUDE.md-style skill document plus one JSONL
-line under `metrics/distill_runs.jsonl` capturing the prompt, configuration,
-quality verdict, elapsed time, and system snapshot. The skill doc can be dropped
-straight into a Claude Code project's `CLAUDE.md` to seed agent context.
+Expected outcome of step 5: a single Python module written to
+`skills/<theme>.py` (importable as `skills.<theme>`) plus one JSONL line under
+`metrics/distill_runs.jsonl` capturing the prompt, configuration, quality
+verdict, elapsed time, and system snapshot. The skill module can be imported
+directly by Aider, browser-use, or any future agent. Step 5 assumes the
+`web_brain_clean` Qdrant collection already has chunks for the theme (use
+`web_research.py` + `cleanse_chunk.py` to populate it first).
 
 ## Distillation pipeline (Phase 3)
 
 `corpus2skill.py` is the main Phase 3 entry point. Given a theme (e.g.
-`asyncio`, `kubernetes`), it performs web research, cleanses retrieved
-chunks, distills them through `deepseek-r1:14b` (with optional fallback
-to `qwen2.5-coder:7b`) into a single CLAUDE.md-style skill document, and
-runs a quality loop that validates the output before persisting.
+`asyncio`, `kubernetes`), it pulls the matching chunks out of the
+`web_brain_clean` Qdrant collection (populated upstream by the Phase 2.5
+`web_research.py` + `cleanse_chunk.py` pipeline), distills them through
+`deepseek-r1:14b` (with optional fallback to `qwen2.5-coder:7b`) into a
+single reusable Python module written to `skills/<theme>.py`, and runs a
+quality loop that validates the output before persisting.
 
 | Phase | Feature | Detail |
 |---|---|---|
