@@ -23,6 +23,7 @@ import argparse
 import ast
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -569,7 +570,80 @@ def gemini_review(
 # raw_response / extracted_code は冗長 (skill_path から物理ファイル復元可) のため
 # JSONL では除外し、ファイル肥大化を抑制する。schema 進化は schema_version で管理。
 
-METRICS_SCHEMA_VERSION = 1
+METRICS_SCHEMA_VERSION = 2
+
+
+def _safe_int_subproc(cmd: list[str], timeout: int = 3) -> int | None:
+    """subprocess で先頭行の int を取得。失敗は全て None で吸収 (記録の degrade を許容)。"""
+    try:
+        out = subprocess.check_output(
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout
+        )
+        return int(out.strip().splitlines()[0])
+    except (
+        subprocess.SubprocessError,
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        IndexError,
+    ):
+        return None
+
+
+def _safe_ram_used_mb() -> int | None:
+    """/proc/meminfo から (MemTotal - MemAvailable) MB を取得。"""
+    try:
+        info: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            parts = line.split(":")
+            if len(parts) == 2:
+                info[parts[0].strip()] = int(parts[1].split()[0])  # kB
+        return (info["MemTotal"] - info["MemAvailable"]) // 1024
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _safe_loadavg() -> list[float] | None:
+    try:
+        return list(os.getloadavg())
+    except OSError:
+        return None
+
+
+def _safe_concurrent_models(
+    base_url: str = "http://127.0.0.1:11434", timeout: int = 3
+) -> list[str] | None:
+    """Ollama /api/ps で同時 load 中の model name list を取得 (stdlib のみ)。
+    Ollama 未起動・network 失敗は None で degrade。"""
+    try:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{base_url}/api/ps", headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8"))
+        return [
+            m["name"] for m in data.get("models", []) if isinstance(m.get("name"), str)
+        ]
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def _collect_system_snapshot() -> dict:
+    """nvidia-smi / meminfo / loadavg / Ollama loaded models の現在値 snapshot。
+    Phase 3.7d で schema_version=2 から追加。各項目は失敗時 None で degrade。"""
+    vram = _safe_int_subproc(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    )
+    return {
+        "vram_used_mb": vram,
+        "nvidia_smi_available": vram is not None,
+        "ram_used_mb": _safe_ram_used_mb(),
+        "loadavg": _safe_loadavg(),
+        "concurrent_models": _safe_concurrent_models(),
+    }
 
 
 def _safe_git_rev() -> str | None:
@@ -598,9 +672,11 @@ def _build_metrics_record(
     result: "DistillResult",
     args: argparse.Namespace,
     started_at: str,
+    system_baseline: dict | None = None,
 ) -> dict:
-    """DistillResult + CLI config snapshot + 環境メタを 1 dict にまとめる。
-    Path は str 化、tuple は list 化 (json.dumps 互換)。"""
+    """DistillResult + CLI config snapshot + 環境メタ + system snapshot を 1 dict にまとめる。
+    Path は str 化、tuple は list 化 (json.dumps 互換)。
+    Phase 3.7d (schema_version=2): system_baseline / system_end snapshot を追加。"""
     d = dataclasses.asdict(result)
     # 重複かつ大きいフィールドを drop
     d.pop("raw_response", None)
@@ -632,6 +708,11 @@ def _build_metrics_record(
         "git_commit": _safe_git_rev(),
         "host": _safe_hostname(),
         "schema_version": METRICS_SCHEMA_VERSION,
+    }
+    # Phase 3.7d: system snapshot (baseline は distill 開始前に取得、end は本記録時)
+    d["system"] = {
+        "baseline": system_baseline if system_baseline is not None else {},
+        "end": _collect_system_snapshot(),
     }
     return d
 
@@ -1135,6 +1216,9 @@ def distill(
 def main() -> int:
     # Phase 3.7: 実行開始時刻 (UTC ISO 8601)、metrics JSONL の started_at field 用
     started_at = datetime.now(timezone.utc).isoformat()
+    # Phase 3.7d: distill 開始前の system snapshot (baseline)、record build 時に
+    # end snapshot と対比する。collect 失敗は None で degrade、record には空 dict で残す。
+    system_baseline = _collect_system_snapshot()
     ap = argparse.ArgumentParser(
         description=(
             "Phase 3 Corpus2Skill PoC: web_brain_clean からテーマ別 chunks を "
@@ -1345,7 +1429,7 @@ def main() -> int:
     # Phase 3.7: metrics JSONL 書出し (成功/失敗どちらも記録、--no-metrics で無効化)。
     # distillation の成功手前で書くことで、後段の return 1 / 0 どちらの path でも記録される。
     if not args.no_metrics:
-        record = _build_metrics_record(result, args, started_at)
+        record = _build_metrics_record(result, args, started_at, system_baseline)
         if _append_metrics_jsonl(Path(args.metrics_file), record):
             print(f"metrics:  appended to {args.metrics_file}", file=sys.stderr)
 

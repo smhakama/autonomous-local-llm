@@ -41,6 +41,11 @@ ALLOWED_GROUP_FIELDS = {
     "meta.host",
     "meta.git_commit",
     "meta.schema_version",
+    # Phase 3.7d: system snapshot bool fields (numeric fields like vram_used_mb
+    # are continuous and not useful as group keys; list fields like
+    # concurrent_models are not hashable). Filter/inspect those via jq instead.
+    "system.baseline.nvidia_smi_available",
+    "system.end.nvidia_smi_available",
 }
 
 
