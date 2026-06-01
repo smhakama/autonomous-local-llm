@@ -45,6 +45,7 @@ from router import (
     append_router_record,
     build_critic_prompt,
     build_router_record,
+    format_critic_hint,
 )
 
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -132,6 +133,16 @@ DEFAULT_ROUTER_METRICS_FILE = "metrics/router_runs.jsonl"
 # Phase 3.8a NT6 verdict 固定値 — 半年先の再評価で別 sweet spot が出るまで固定。
 ROUTER_NUM_THREAD = 6
 
+# --- Phase 3.8c router-feedback (critic findings → proposer retry) ---
+# router_feedback='none' で Phase 3.8b 完全互換 (router は attempt 1 のみ、inject なし)。
+# 'on-retry'    : attempt 1 router の findings を memoize、attempts 2+ で 1 度だけ inject
+#                  し以降 prompt 持ち回し (router は 1 回のみ稼働、コスト = 3.8b 同等)。
+# 'every-attempt': 全 attempt で router 稼働、各 attempt の critic 出力を NEXT attempt の
+#                  prompt に inject (毎回最新の findings に replace、累積はしない)。
+#                  Gemini second-opinion 推し、Phase 3.8c の研究 default。
+DEFAULT_ROUTER_FEEDBACK = "every-attempt"
+ROUTER_FEEDBACK_CHOICES = ("none", "on-retry", "every-attempt")
+
 QUALITY_REVIEW_PROMPT_TEMPLATE = """Review each public callable (top-level def/class, no leading underscore) in the following Python module.
 
 Output EXACTLY one line per callable, format:
@@ -215,6 +226,12 @@ class DistillResult:
     router_strategy: str | None = None
     router_wall_sec: float | None = None
     router_critic_findings_count: int | None = None
+    # Phase 3.8c: critic findings を proposer retry に feed する merge loop の
+    # 実行 metadata。feedback mode == 'none' または router 未稼働なら None。
+    # router_findings_injected_count = critic hint が proposer prompt に注入された
+    # attempts 数 (on-retry なら最大 max_retries-1、every-attempt なら同上 + α)。
+    router_feedback_mode: str | None = None
+    router_findings_injected_count: int | None = None
 
 
 def fetch_chunks_by_theme(
@@ -607,7 +624,9 @@ def gemini_review(
 
 # Phase 3.8b: schema v3 = v2 + DistillResult.router_strategy/wall_sec/critic_findings_count
 # (default None で v2 parser 互換)、config snapshot に router_strategy/critic_model 追加。
-METRICS_SCHEMA_VERSION = 3
+# Phase 3.8c: schema v4 = v3 + DistillResult.router_feedback_mode/findings_injected_count
+# (default None で v3 parser 互換、additive のみ)、config snapshot に router_feedback 追加。
+METRICS_SCHEMA_VERSION = 4
 
 
 def _safe_int_subproc(cmd: list[str], timeout: int = 3) -> int | None:
@@ -741,6 +760,8 @@ def _build_metrics_record(
         "router_strategy": args.router_strategy,
         "critic_model": args.critic_model,
         "router_metrics_file": args.router_metrics_file,
+        # Phase 3.8c: critic→proposer feedback mode
+        "router_feedback": args.router_feedback,
     }
     # 環境メタ
     d["meta"] = {
@@ -950,6 +971,7 @@ def distill(
     router_strategy: str = DEFAULT_ROUTER_STRATEGY,
     critic_model: str = DEFAULT_CRITIC_MODEL,
     router_metrics_file: Path | None = None,
+    router_feedback: str = DEFAULT_ROUTER_FEEDBACK,
 ) -> DistillResult:
     """蒸留 + L1 (syntax) + L2 (import) + L3 (callables ≥1) を retry loop に組み込む。
 
@@ -967,6 +989,11 @@ def distill(
         )
     if rag_adaptive and not rag_schedule:
         raise ValueError("rag_adaptive=True のとき rag_schedule は非空必須")
+    if router_feedback not in ROUTER_FEEDBACK_CHOICES:
+        raise ValueError(
+            f"router_feedback must be one of {ROUTER_FEEDBACK_CHOICES}, "
+            f"got {router_feedback!r}"
+        )
     qd = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     chunks = fetch_chunks_by_theme(qd, collection, theme)
     if not chunks:
@@ -1035,6 +1062,12 @@ def distill(
     router_strategy_used: str | None = None
     router_wall_sec_used: float | None = None
     router_findings_count_used: int | None = None
+    # Phase 3.8c: critic findings → proposer retry merge loop state。
+    # last_critic_findings = 直前 attempt の critic 出力 (memoize)、空 tuple は
+    # まだ critic 未実行か feedback=='none' (注入なし)。
+    last_critic_findings: tuple[str, ...] = ()
+    router_feedback_mode_used: str | None = None
+    router_findings_injected_count_used: int = 0
     t0 = time.time()
     for attempt in range(1, max_retries + 1):
         attempts = attempt
@@ -1042,14 +1075,35 @@ def distill(
             f"[3/3] attempt {attempt}/{max_retries}: "
             f"distilling via {model} (timeout={timeout}s)..."
         )
-        # Phase 3.8b: 初回 attempt のみ router strategy を稼働。retry は単一 model
-        # で十分 (critic は「最初の独立 view」が PoC の目的、retry hint と無関係)。
-        if attempt == 1 and router_strategy == "asymmetric_debate":
+        # Phase 3.8c: critic hint overlay。prompt 自体は L1/L2/L3 feedback で
+        # cumulative 変異させ、critic hint は per-attempt overlay で末尾追加
+        # (毎 attempt 最新 findings に replace、累積はしない)。
+        if router_feedback != "none" and last_critic_findings:
+            critic_hint = format_critic_hint(last_critic_findings)
+            effective_prompt = prompt + critic_hint
+            if router_feedback_mode_used is None:
+                router_feedback_mode_used = router_feedback
+            router_findings_injected_count_used += 1
+            print(
+                f"      [router-feedback] {router_feedback} mode: injected "
+                f"{len(last_critic_findings)} critic findings into proposer prompt"
+            )
+        else:
+            effective_prompt = prompt
+        # Phase 3.8b/3.8c: router strategy を稼働する attempt を decide。
+        # Phase 3.8b 互換: feedback='none' のとき attempt==1 のみ router (legacy)。
+        # Phase 3.8c on-retry: attempt==1 のみ router、findings は次以降の inject へ。
+        # Phase 3.8c every-attempt: 全 attempt で router 稼働、findings 毎回 refresh。
+        router_runs_this_attempt = (
+            router_strategy == "asymmetric_debate"
+            and (attempt == 1 or router_feedback == "every-attempt")
+        )
+        if router_runs_this_attempt:
             try:
                 router_result = _run_asymmetric_debate(
                     theme=theme,
                     chunks=chunks,
-                    proposer_prompt=prompt,
+                    proposer_prompt=effective_prompt,
                     proposer_model=model,
                     critic_model=critic_model,
                     timeout=timeout,
@@ -1063,12 +1117,18 @@ def distill(
                 )
                 continue
             raw = router_result.chosen_text
-            router_strategy_used = router_result.strategy_name
-            router_wall_sec_used = router_result.parallel_wall_sec
-            router_findings_count_used = len(router_result.critic_findings)
+            if attempt == 1:
+                # Phase 3.8b legacy fields は attempt 1 router の値を保持 (後方互換)。
+                router_strategy_used = router_result.strategy_name
+                router_wall_sec_used = router_result.parallel_wall_sec
+                router_findings_count_used = len(router_result.critic_findings)
+            # Phase 3.8c: NEXT attempt の proposer prompt に inject するため memo。
+            # feedback='none' でも router が走ったら memo するが、overlay 適用は
+            # router_feedback != 'none' のときのみ (条件は loop 先頭で再評価)。
+            last_critic_findings = router_result.critic_findings
         else:
             try:
-                raw = call_14b(prompt, model=model, timeout=timeout)
+                raw = call_14b(effective_prompt, model=model, timeout=timeout)
             except requests.exceptions.RequestException as e:
                 last_err = f"14B request failed: {type(e).__name__}: {e}"
                 print(f"      [ERROR] {last_err}", file=sys.stderr)
@@ -1110,6 +1170,8 @@ def distill(
                 router_strategy=router_strategy_used,
                 router_wall_sec=router_wall_sec_used,
                 router_critic_findings_count=router_findings_count_used,
+                router_feedback_mode=router_feedback_mode_used,
+                router_findings_injected_count=router_findings_injected_count_used,
             )
 
         # L2: import 検証 (ファイルを実 path に書いて subprocess import)
@@ -1150,6 +1212,8 @@ def distill(
                 router_strategy=router_strategy_used,
                 router_wall_sec=router_wall_sec_used,
                 router_critic_findings_count=router_findings_count_used,
+                router_feedback_mode=router_feedback_mode_used,
+                router_findings_injected_count=router_findings_injected_count_used,
             )
 
         # Phase 3.2 quality loop: L4 (mypy) + L5 (Gemini) を最大 quality_max_retries 回
@@ -1184,6 +1248,8 @@ def distill(
                     router_strategy=router_strategy_used,
                     router_wall_sec=router_wall_sec_used,
                     router_critic_findings_count=router_findings_count_used,
+                    router_feedback_mode=router_feedback_mode_used,
+                    router_findings_injected_count=router_findings_injected_count_used,
                 )
             final_feedback = feedback
             if q_attempt >= quality_max_retries:
@@ -1380,6 +1446,8 @@ def distill(
             router_strategy=router_strategy_used,
             router_wall_sec=router_wall_sec_used,
             router_critic_findings_count=router_findings_count_used,
+            router_feedback_mode=router_feedback_mode_used,
+            router_findings_injected_count=router_findings_injected_count_used,
         )
 
     elapsed = time.time() - t0
@@ -1393,6 +1461,8 @@ def distill(
         router_strategy=router_strategy_used,
         router_wall_sec=router_wall_sec_used,
         router_critic_findings_count=router_findings_count_used,
+        router_feedback_mode=router_feedback_mode_used,
+        router_findings_injected_count=router_findings_injected_count_used,
     )
 
 
@@ -1568,6 +1638,19 @@ def main() -> int:
         "--no-router-metrics", action="store_true",
         help="router_runs.jsonl 書出しを skip (Phase 3.8b)",
     )
+    ap.add_argument(
+        "--router-feedback",
+        choices=list(ROUTER_FEEDBACK_CHOICES),
+        default=DEFAULT_ROUTER_FEEDBACK,
+        help=(
+            f"critic findings → proposer retry merge loop mode "
+            f"(default {DEFAULT_ROUTER_FEEDBACK!r}、Phase 3.8c)。"
+            "'none' で Phase 3.8b 互換 (inject なし)、"
+            "'on-retry' で attempt 1 router → findings memoize → attempts 2+ で 1 度 inject、"
+            "'every-attempt' で 全 attempt router 稼働 + 各 attempt の findings を次回 prompt に inject。"
+            "router_strategy='none' のときは無視される。"
+        ),
+    )
     args = ap.parse_args()
 
     # --list-models: registry を表示して即 exit (Phase 3.6)
@@ -1647,6 +1730,7 @@ def main() -> int:
         router_strategy=args.router_strategy,
         critic_model=args.critic_model,
         router_metrics_file=router_metrics_path,
+        router_feedback=args.router_feedback,
     )
 
     # Phase 3.7: metrics JSONL 書出し (成功/失敗どちらも記録、--no-metrics で無効化)。

@@ -27,10 +27,12 @@ import pytest
 import corpus2skill
 from corpus2skill import (
     DEFAULT_CRITIC_MODEL,
+    DEFAULT_ROUTER_FEEDBACK,
     DEFAULT_ROUTER_METRICS_FILE,
     DEFAULT_ROUTER_STRATEGY,
     METRICS_SCHEMA_VERSION,
     MODEL_REGISTRY,
+    ROUTER_FEEDBACK_CHOICES,
     ROUTER_NUM_THREAD,
     DistillResult,
     _build_metrics_record,
@@ -127,11 +129,13 @@ def _make_args() -> argparse.Namespace:
         router_strategy="asymmetric_debate",
         critic_model=DEFAULT_CRITIC_MODEL,
         router_metrics_file="metrics/router_runs.jsonl",
+        router_feedback=DEFAULT_ROUTER_FEEDBACK,
     )
 
 
-def test_metrics_schema_version_bumped_to_three() -> None:
-    assert METRICS_SCHEMA_VERSION == 3
+def test_metrics_schema_version_bumped_to_four() -> None:
+    """Phase 3.8c: schema v4 (additive router_feedback_mode + injected_count)."""
+    assert METRICS_SCHEMA_VERSION == 4
 
 
 def test_build_metrics_record_includes_router_config_snapshot() -> None:
@@ -162,7 +166,8 @@ def test_build_metrics_record_includes_router_config_snapshot() -> None:
     assert rec["config"]["router_strategy"] == "asymmetric_debate"
     assert rec["config"]["critic_model"] == DEFAULT_CRITIC_MODEL
     assert rec["config"]["router_metrics_file"] == "metrics/router_runs.jsonl"
-    assert rec["meta"]["schema_version"] == 3
+    assert rec["config"]["router_feedback"] == DEFAULT_ROUTER_FEEDBACK
+    assert rec["meta"]["schema_version"] == 4
 
 
 def test_build_metrics_record_router_fields_default_null() -> None:
@@ -226,6 +231,25 @@ def test_cli_help_advertises_all_router_flags() -> None:
     assert "--critic-model" in text
     assert "--router-metrics-file" in text
     assert "--no-router-metrics" in text
+    # Phase 3.8c: --router-feedback flag with 3 choices.
+    assert "--router-feedback" in text
+    assert "{none,on-retry,every-attempt}" in text
+
+
+def test_cli_rejects_unknown_router_feedback() -> None:
+    proc = _run_corpus(
+        ["--theme", "dummy", "--router-feedback", "bogus_mode"]
+    )
+    assert proc.returncode != 0
+    assert "invalid choice" in proc.stderr.lower() or "bogus_mode" in proc.stderr
+
+
+def test_default_router_feedback_is_every_attempt() -> None:
+    """Phase 3.8c default: every-attempt (Gemini second-opinion 推し、研究方針)。"""
+    assert DEFAULT_ROUTER_FEEDBACK == "every-attempt"
+    assert "every-attempt" in ROUTER_FEEDBACK_CHOICES
+    assert "on-retry" in ROUTER_FEEDBACK_CHOICES
+    assert "none" in ROUTER_FEEDBACK_CHOICES
 
 
 def test_cli_rejects_unknown_router_strategy() -> None:
@@ -376,3 +400,244 @@ def test_run_asymmetric_debate_passes_num_thread_six_to_both_runners(
         p for p in captured_payloads if p["model"] == DEFAULT_CRITIC_MODEL
     )
     assert critic_payload["options"]["num_gpu"] == 0
+
+
+# -------------------------------------------------------------------------
+# Phase 3.8c: distill() router-feedback merge loop integration
+# -------------------------------------------------------------------------
+#
+# Strategy: stub out fetch_chunks_by_theme + QdrantClient + _run_asymmetric_debate
+# + call_14b so distill() runs through the retry loop without any I/O. The
+# stubbed proposer output is a code block with a syntax error (``def
+# broken_``) so every attempt fails L1 and the loop runs to max_retries.
+# That gives us 3 distinct proposer prompts to inspect for hint injection.
+
+
+from router.runners import ModelOutput  # noqa: E402
+from router.strategies import RouterResult  # noqa: E402
+
+
+_BROKEN_CODE_BLOCK = "```python\ndef broken_\n```"
+
+
+def _make_router_result(findings: tuple[str, ...]) -> RouterResult:
+    """Build a RouterResult whose chosen_text fails L1 syntax check."""
+    base_output = ModelOutput(
+        text=_BROKEN_CODE_BLOCK,
+        role="proposer",
+        model_id="deepseek-r1:14b",
+        prompt_eval_count=10,
+        eval_count=20,
+        eval_duration_ns=1_000_000_000,
+        prompt_eval_duration_ns=100_000_000,
+        total_duration_ns=1_100_000_000,
+        load_duration_ns=0,
+    )
+    critic_output = ModelOutput(
+        text="\n".join(f"- {f}" for f in findings),
+        role="critic",
+        model_id=DEFAULT_CRITIC_MODEL,
+        prompt_eval_count=10,
+        eval_count=20,
+        eval_duration_ns=900_000_000,
+        prompt_eval_duration_ns=100_000_000,
+        total_duration_ns=1_000_000_000,
+        load_duration_ns=0,
+    )
+    return RouterResult(
+        strategy_name="asymmetric_debate",
+        proposer_output=base_output,
+        critic_output=critic_output,
+        chosen_text=_BROKEN_CODE_BLOCK,
+        critic_findings=findings,
+        parallel_wall_sec=1.0,
+        started_at="2026-06-01T00:00:00+00:00",
+        finished_at="2026-06-01T00:00:01+00:00",
+    )
+
+
+@pytest.fixture
+def stub_distill_io(monkeypatch):
+    """Patch out QdrantClient + chunks + call_14b so distill() is hermetic.
+
+    Returns the captured single-model prompts list (mutated by the test).
+    """
+    monkeypatch.setattr(corpus2skill, "QdrantClient", lambda **kw: MagicMock())
+    monkeypatch.setattr(
+        corpus2skill,
+        "fetch_chunks_by_theme",
+        lambda *a, **k: [{"url": "u", "heading_path": "h", "text": "t"}],
+    )
+    captured_single: list[str] = []
+
+    def fake_call_14b(prompt: str, **kwargs: object) -> str:
+        captured_single.append(prompt)
+        return _BROKEN_CODE_BLOCK
+
+    monkeypatch.setattr(corpus2skill, "call_14b", fake_call_14b)
+    return captured_single
+
+
+def test_router_feedback_none_does_not_inject_hint(
+    monkeypatch, stub_distill_io, tmp_path
+) -> None:
+    """feedback='none' で attempts 2+ の call_14b prompt に hint が含まれない。
+
+    Phase 3.8b 完全互換: router は attempt 1 のみ稼働、findings は memo されるが
+    proposer prompt overlay は適用されない。
+    """
+    captured_proposer: list[str] = []
+
+    def fake_router(*, proposer_prompt, **kw):
+        captured_proposer.append(proposer_prompt)
+        return _make_router_result(("pitfall ALPHA", "pitfall BETA"))
+
+    monkeypatch.setattr(corpus2skill, "_run_asymmetric_debate", fake_router)
+
+    result = corpus2skill.distill(
+        "k8s",
+        collection="c",
+        max_retries=3,
+        timeout=10,
+        verify=False,
+        quality_loop=False,
+        router_strategy="asymmetric_debate",
+        critic_model=DEFAULT_CRITIC_MODEL,
+        router_metrics_file=None,
+        router_feedback="none",
+    )
+
+    # All 3 attempts hit L1 syntax fail; attempt 1=router, 2-3=call_14b
+    assert not result.valid
+    assert result.attempts == 3
+    assert len(captured_proposer) == 1  # only attempt 1 used router
+    assert len(stub_distill_io) == 2  # attempts 2 + 3 used single-model
+
+    # feedback='none' means NO hint header in any call_14b prompt
+    for p in stub_distill_io:
+        assert "PRIOR INDEPENDENT REVIEWER" not in p
+        assert "pitfall ALPHA" not in p
+        assert "pitfall BETA" not in p
+
+    # DistillResult fields reflect "feedback disabled"
+    assert result.router_feedback_mode is None
+    assert result.router_findings_injected_count == 0
+    # Phase 3.8b legacy fields still populated from attempt 1 router run
+    assert result.router_strategy == "asymmetric_debate"
+    assert result.router_critic_findings_count == 2
+
+
+def test_router_feedback_on_retry_injects_memoized_findings_each_attempt(
+    monkeypatch, stub_distill_io, tmp_path
+) -> None:
+    """feedback='on-retry' で attempt 1 findings が attempts 2/3 prompt に注入。
+
+    router は attempt 1 のみ稼働 (on-retry semantics)、findings はその後の
+    すべての retry に持ち回し。インジェクトの中身は不変 (memoized)。
+    """
+    captured_proposer: list[str] = []
+    router_call_count = {"n": 0}
+
+    def fake_router(*, proposer_prompt, **kw):
+        captured_proposer.append(proposer_prompt)
+        router_call_count["n"] += 1
+        return _make_router_result(("avoid mutable default args",
+                                     "use pathlib not os.path"))
+
+    monkeypatch.setattr(corpus2skill, "_run_asymmetric_debate", fake_router)
+
+    result = corpus2skill.distill(
+        "k8s",
+        collection="c",
+        max_retries=3,
+        timeout=10,
+        verify=False,
+        quality_loop=False,
+        router_strategy="asymmetric_debate",
+        critic_model=DEFAULT_CRITIC_MODEL,
+        router_metrics_file=None,
+        router_feedback="on-retry",
+    )
+
+    # Router runs ONCE (attempt 1 only), attempts 2/3 are single-model
+    assert router_call_count["n"] == 1
+    assert len(captured_proposer) == 1
+    assert len(stub_distill_io) == 2
+
+    # Both call_14b prompts (attempts 2, 3) contain the SAME hint (memoized)
+    for p in stub_distill_io:
+        assert "PRIOR INDEPENDENT REVIEWER" in p
+        assert "- avoid mutable default args" in p
+        assert "- use pathlib not os.path" in p
+
+    # Attempt 1's proposer prompt has NO hint (attempt 1 has no prior findings)
+    assert "PRIOR INDEPENDENT REVIEWER" not in captured_proposer[0]
+
+    # DistillResult fields reflect 2 injection attempts (2 + 3)
+    assert result.router_feedback_mode == "on-retry"
+    assert result.router_findings_injected_count == 2
+
+
+def test_router_feedback_every_attempt_refreshes_findings_each_call(
+    monkeypatch, stub_distill_io, tmp_path
+) -> None:
+    """feedback='every-attempt' で router 毎 attempt 稼働 + findings 毎回 replace。
+
+    各 attempt の critic 出力は次 attempt の proposer prompt にのみ inject
+    (累積はしない、最新だけ)。本 test では critic を 3 attempt それぞれ別の
+    findings tuple を返すよう仕込み、attempt N+1 の prompt が attempt N の
+    findings を反映していることを検証。
+    """
+    captured_proposer: list[str] = []
+    findings_sequence = [
+        ("alpha_1", "alpha_2"),
+        ("beta_1", "beta_2"),
+        ("gamma_1", "gamma_2"),
+    ]
+    call_idx = {"n": 0}
+
+    def fake_router(*, proposer_prompt, **kw):
+        captured_proposer.append(proposer_prompt)
+        idx = call_idx["n"]
+        call_idx["n"] += 1
+        # findings from THIS attempt's critic carry to NEXT attempt's proposer
+        return _make_router_result(findings_sequence[idx])
+
+    monkeypatch.setattr(corpus2skill, "_run_asymmetric_debate", fake_router)
+
+    result = corpus2skill.distill(
+        "k8s",
+        collection="c",
+        max_retries=3,
+        timeout=10,
+        verify=False,
+        quality_loop=False,
+        router_strategy="asymmetric_debate",
+        critic_model=DEFAULT_CRITIC_MODEL,
+        router_metrics_file=None,
+        router_feedback="every-attempt",
+    )
+
+    # Router runs on EVERY attempt (3 calls), call_14b unused
+    assert call_idx["n"] == 3
+    assert len(captured_proposer) == 3
+    assert len(stub_distill_io) == 0
+
+    # Attempt 1: no hint (no prior findings)
+    assert "PRIOR INDEPENDENT REVIEWER" not in captured_proposer[0]
+    # Attempt 2: hint contains attempt 1's findings (alpha_*)
+    assert "PRIOR INDEPENDENT REVIEWER" in captured_proposer[1]
+    assert "- alpha_1" in captured_proposer[1]
+    assert "- alpha_2" in captured_proposer[1]
+    # Attempt 2 prompt MUST NOT contain attempt 2's own findings (beta_*)
+    assert "- beta_1" not in captured_proposer[1]
+    # Attempt 3: hint contains attempt 2's findings (beta_*), NOT alpha or gamma
+    assert "PRIOR INDEPENDENT REVIEWER" in captured_proposer[2]
+    assert "- beta_1" in captured_proposer[2]
+    assert "- beta_2" in captured_proposer[2]
+    assert "- alpha_1" not in captured_proposer[2]
+    assert "- gamma_1" not in captured_proposer[2]
+
+    # DistillResult: 2 injection events (attempts 2 + 3)
+    assert result.router_feedback_mode == "every-attempt"
+    assert result.router_findings_injected_count == 2
