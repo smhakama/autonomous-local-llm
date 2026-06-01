@@ -231,6 +231,73 @@ collections without warning. The repository now ships a `docker-compose.yml`
 that uses a Docker *named volume* (`qdrant_data`) instead of a bind mount;
 bring Qdrant up with `docker compose up -d`.
 
+## Critic→proposer merge loop (Phase 3.8c)
+
+Phase 3.8b recorded critic findings in `router_runs.jsonl` but never fed them
+back to the proposer. Phase 3.8c closes that loop: critic findings can now be
+injected into the proposer prompt on retries via a `--router-feedback` flag.
+
+Three modes, all opt-in (only fire when `--router-strategy asymmetric_debate`):
+
+| `--router-feedback` | router runs | hint injection | proposer prompts per attempt |
+|---|---|---|---|
+| `none` | attempt 1 only | never | base prompt + L1/L2/L3 feedback only (Phase 3.8b parity) |
+| `on-retry` | attempt 1 only | attempts 2+ reuse memoized findings | base + feedback + same hint each retry |
+| `every-attempt` (default) | every attempt | attempt N+1 sees attempt N's critic | base + feedback + fresh hint per retry |
+
+Findings are formatted as a `PRIOR INDEPENDENT REVIEWER ... FLAGGED THESE
+PITFALLS PRE-EMPTIVELY` block appended after L1/L2/L3 corrective feedback —
+clearly distinct from hard-error retries so the model treats the bullets as
+advisory, not as compile errors. Each block is clipped to 10 bullets to keep
+prompts bounded.
+
+Example invocation:
+
+```bash
+python corpus2skill.py \
+  --theme "Kubernetes pod security standards" \
+  --router-strategy asymmetric_debate \
+  --router-feedback every-attempt
+```
+
+### Smoke run (Phase 3.8c, kubernetes, commit 07b79a3)
+
+Same `web_brain_clean` corpus (2 cleansed chunks from `kubernetes.io` pod
+security standards docs) ran through all 3 modes back-to-back. Models had
+already been pulled but the daemon was cold for the first run.
+
+| Mode | attempts | wall (s) | router_wall_sec | critic findings | injected_count |
+|---|---|---|---|---|---|
+| `none` | 2 (L2 import fail → call_14b retry) | 552.6 | 338.9 (cold load) | 9 | 0 |
+| `on-retry` | 1 (L1+L2+L3 PASS) | 194.3 | 194.0 (warm) | 8 | 0 |
+| `every-attempt` | 1 (L1+L2+L3 PASS) | 192.3 | 192.3 (warm) | 8 | 0 |
+
+All three runs succeeded. **Two findings worth recording:**
+
+1. **`deepseek-r1:14b` on a 2-chunk corpus passed L1+L2+L3 on attempt 1 in
+   2/3 runs, so the merge loop dispatch fired but `injected_count = 0` for
+   all modes.** Hint injection is exercised by the monkeypatched integration
+   tests (`tests/test_corpus2skill_integration.py`), not the live smoke. A
+   harder corpus or a weaker proposer would be needed to trigger real-world
+   injection — pencilled in for the deferred experiment harness.
+2. **Critic findings were near-identical across runs**: the top 2 bullets
+   were verbatim the same in all 3 modes (e.g.
+   *"Misinterpreting Undefined/nil as a valid value..."*,
+   *"Incorrectly assuming all spec fields are always present..."*), and 6 of
+   8 bullets overlapped pairwise. With the chunks fixed and the critic prompt
+   stable, `every-attempt` produces ≈ the same findings each iteration as
+   `on-retry` — so the extra token cost (one full critic pass per attempt)
+   buys very little new signal in this corpus shape. A future Phase 3.8d
+   could either raise critic temperature or move to *critic-on-proposer-
+   output* (Phase 3.8c proposal C) for genuinely fresh per-attempt feedback.
+
+### Schema bump (`distill_runs.jsonl` v3 → v4)
+
+`router_feedback_mode` and `router_findings_injected_count` are now top-level
+fields on each record (both `null` when no injection ran), plus `router_feedback`
+is appended to the `config` snapshot. Additive and nullable, so v3 parsers
+keep working on v4 records — same compatibility contract as the v2→v3 bump.
+
 ## Verified configuration
 
 ### Ollama-via-Aider
