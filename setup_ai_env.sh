@@ -158,7 +158,8 @@ pip install --upgrade \
   aider-chat \
   browser-use \
   langchain-ollama \
-  playwright
+  playwright \
+  pytest
 
 log "playwright chromium インストール"
 playwright install chromium

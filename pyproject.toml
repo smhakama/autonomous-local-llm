@@ -1,0 +1,7 @@
+# Phase 3.8b: pyproject.toml exists solely to host tool configurations
+# (pytest, future ruff/mypy). This project is not a distributable package;
+# environment setup is script-based via setup_ai_env.sh.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
