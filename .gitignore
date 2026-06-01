@@ -38,3 +38,7 @@ cleanse_output/
 # Phase 3.7 metrics — run-by-run JSONL append (per-host history)
 # 再現性は record 内の git_commit field で担保するため git 管理しない
 metrics/
+
+# Phase 3.8a experiments/runs — per-execution logs and summary.jsonl.
+# Matrix definitions under experiments/matrices/ are tracked; outputs are not.
+experiments/runs/

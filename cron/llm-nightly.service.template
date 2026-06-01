@@ -1,0 +1,33 @@
+# Phase 3.8a-Mini systemd user service template.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   sed "s|__REPO__|$HOME/projects/autonomous-local-llm|g" \
+#     cron/llm-nightly.service.template > ~/.config/systemd/user/llm-nightly.service
+#   sed "s|__REPO__|$HOME/projects/autonomous-local-llm|g" \
+#     cron/llm-nightly.timer.template > ~/.config/systemd/user/llm-nightly.timer
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now llm-nightly.timer
+#
+# Verify:
+#   systemctl --user list-timers llm-nightly.timer
+#   systemctl --user status llm-nightly.service
+#
+# Disable:
+#   systemctl --user disable --now llm-nightly.timer
+
+[Unit]
+Description=autonomous-local-llm nightly experiment matrix (Phase 3.8a)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO__
+ExecStart=__REPO__/cron/llm_nightly_experiment.sh
+# stdout/stderr already redirected to $LLM_NIGHTLY_LOG by the shell script,
+# so we keep journald output minimal.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

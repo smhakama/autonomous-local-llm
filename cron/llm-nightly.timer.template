@@ -1,0 +1,19 @@
+# Phase 3.8a-Mini systemd user timer template.
+# See cron/llm-nightly.service.template for install instructions.
+#
+# OnCalendar fires 02:00 every day in the user's timezone.
+# Persistent=true catches up if the timer was missed (WSL shutdown).
+# RandomizedDelaySec spreads load if multiple matrices are ever scheduled.
+
+[Unit]
+Description=Schedule for autonomous-local-llm nightly experiment matrix
+Requires=llm-nightly.service
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=llm-nightly.service
+
+[Install]
+WantedBy=timers.target

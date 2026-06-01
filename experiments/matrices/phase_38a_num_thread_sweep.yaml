@@ -1,0 +1,28 @@
+# Phase 3.8a-Mini: num_thread sweep around E1 (=6) sweet spot.
+#
+# Refines the Phase 3.7e-2 finding by sampling values either side of
+# num_thread=6. NT4/NT6/NT8/NT10 — 4 configs, 3 runs each, long prompt,
+# wall ≈ 13 min/config → ~50 min total. Designed to fit a 5h overnight
+# window with plenty of slack.
+#
+# Reuses the existing bench harness (bench/parallel_capacity_check.py
+# schema_v3), which appends each result to metrics/parallel_capacity_checks.jsonl.
+# The config_id below is what shows up in that JSONL.
+schema: 1
+matrix_id: phase_38a_num_thread_sweep
+description: num_thread sweep around the Phase 3.7e-2 E1=6 sweet spot
+bench: bench/parallel_capacity_check.py
+common_args:
+  - --runs
+  - "3"
+  - --prompt-mode
+  - long
+sweep:
+  - config_id: NT4
+    extra_args: [--num-thread, "4"]
+  - config_id: NT6
+    extra_args: [--num-thread, "6"]
+  - config_id: NT8
+    extra_args: [--num-thread, "8"]
+  - config_id: NT10
+    extra_args: [--num-thread, "10"]
