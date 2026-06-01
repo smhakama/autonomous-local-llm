@@ -380,6 +380,83 @@ function of the workload, which is why both strategies ship side-by-side.
 for Phase 3.8c+, absent for Phase 3.8b parallel) and the `strategy_name`
 field already disambiguated. `distill_runs.jsonl` is unchanged at v4.
 
+## Harder-corpus injection experiment (Phase 3.8c++)
+
+Phase 3.8c smoke produced `injected_count = 0` for all three modes because
+`deepseek-r1:14b` on 2 cleansed chunks passed L1+L2+L3 on attempt 1. To
+exercise the merge loop in vivo, Phase 3.8c++ added a `--chunks-limit N`
+CLI knob (default 50, backward-compatible) and ran six smoke variants on
+the raw `web_brain` collection (nav / boilerplate noise included).
+
+### Smoke matrix
+
+| Smoke | router | chunks | attempts | wall | injected | finding character |
+|---|---|---|---|---|---|---|
+| E1'  | none       | 8 raw | 2 (retry → PASS) | 491 s   | n/a | n/a |
+| E1'' | none       | 4 raw | 1 (PASS)         | 147 s   | n/a | n/a |
+| E2   | sequential | 8 raw | 3 (all timeout)  | 3079 s  | 0   | n/a — router never returned |
+| **E2''** | **sequential** | **4 raw** | **2 (retry + injection → PASS)** | **1370 s** | **1** | **code-specific (function names cited)** |
+| E3   | parallel   | 8 raw | 3 (all timeout)  | 1800 s  | 0   | n/a — router never returned |
+| E3'' | parallel   | 4 raw | 1 (PASS)         | 519 s   | 0   | abstract (chunks-only critic) |
+
+Three concrete findings emerge from the matrix:
+
+**1. Goldilocks zone for retry-by-natural-failure.** At 8 raw chunks the
+prompt is heavy enough that deepseek-r1:14b reliably trips L2 import on
+attempt 1, but adding the critic (and keeping `gemma2:9b` resident via
+`OLLAMA_MAX_LOADED_MODELS=2`) pushes the proposer past the 600 s timeout —
+both router strategies failed all three attempts. At 4 raw chunks the
+proposer fits comfortably inside the timeout, but L1+L2+L3 usually passes
+on attempt 1, so the merge loop only fires when sampling variance happens
+to hit an import bug (E2'' did, E3'' did not).
+
+**2. Live demonstration of injection firing end-to-end (E2'').** The
+sequential strategy on 4 raw chunks produced this trajectory:
+
+- Attempt 1, sequential critic emitted **5 code-specific findings**:
+  - *"`validate_pod_security_annotations` calls a function that doesn't exist."*
+  - *"`check_container_image_origin` uses a `Set[str]` for allowed registries, but no mechanism is provided to populate this set ..."*
+  - *"`enforce_user_namespaces_used` does not use the provided `config` argument."*
+  - *"`validate_service_account_usage` calls a function that doesn't exist."*
+  - *"`check_forbidden_sysctls` uses a `Dict[str, str]` for sysctl parameters but no mechanism is provided to populate this dictionary ..."*
+- L2 also failed (`ModuleNotFoundError: No module named 'kubernetes'`) on
+  the same attempt 1 output.
+- Attempt 2 fired the merge-loop overlay: log line
+  `[router-feedback] every-attempt mode: injected 5 critic findings into proposer prompt`.
+- Attempt 2 produced a corrected skill with **9 internal-only callables**,
+  no external `kubernetes` import, and a different shape than attempt 1.
+- The attempt-2 critic's new findings (3 of them) describe issues in the
+  *new* code — not the issues injected from attempt 1, confirming the
+  proposer responded to the hint rather than just inheriting the prompt.
+
+**3. Sequential vs parallel finding character is corpus-independent.**
+The E3'' parallel critic, on the same 4 raw chunks, produced abstract
+pitfalls that match the Phase 3.8c smoke pattern:
+
+- *"Hallucinating imports for Kubernetes API versions not explicitly mentioned."*
+- *"Off-by-one errors when iterating over nested lists of documentation links."*
+- *"Using deprecated symbols like `PodSecurityPolicy` instead of the new admission controller."*
+
+These could not name a single function the proposer actually wrote, because
+the parallel critic prompt never sees the proposer's output. The
+chunks-only vs code-review divide held across all corpus variants.
+
+### Operational implication
+
+`sequential_critic_review` reaches its design promise — code-specific,
+per-attempt fresh feedback that drives real-world retries — but its wall
+cost (≈2× proposer + critic on the same hardware) interacts badly with
+larger prompts when both models are resident. Practical guidance:
+
+- For corpora under ~10 KB of cleansed chunks, run `--router-strategy
+  sequential_critic_review` with the default `--timeout 600`.
+- For larger or noisier corpora, either raise `--timeout` (to e.g. 1500 s)
+  or use `--chunks-limit` to bound the proposer prompt, or fall back to
+  the parallel `asymmetric_debate` strategy (smaller wall, abstract
+  feedback only).
+- 16 GB VRAM (deferred) would move `gemma2:9b` onto the GPU and likely
+  collapse the timeout cliff entirely.
+
 ## Verified configuration
 
 ### Ollama-via-Aider
