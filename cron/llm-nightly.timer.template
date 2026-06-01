@@ -7,7 +7,11 @@
 
 [Unit]
 Description=Schedule for autonomous-local-llm nightly experiment matrix
-Requires=llm-nightly.service
+# NOTE: do NOT add `Requires=llm-nightly.service` here. systemd interprets
+# `Requires` in a timer's [Unit] as "the service must be active whenever the
+# timer is active", which causes `systemctl start <timer>` to pull-in the
+# service immediately (verified 2026-06-01 fire test). The `Unit=` directive
+# in [Timer] below is all that is needed to schedule the service.
 
 [Timer]
 OnCalendar=*-*-* 02:00:00
