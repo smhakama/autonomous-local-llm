@@ -298,6 +298,88 @@ fields on each record (both `null` when no injection ran), plus `router_feedback
 is appended to the `config` snapshot. Additive and nullable, so v3 parsers
 keep working on v4 records — same compatibility contract as the v2→v3 bump.
 
+## Sequential critic-on-output review (Phase 3.8c+)
+
+Phase 3.8c smoke proved that a chunks-only critic with a stable prompt
+converges to **near-identical findings each iteration** (top 2 bullets verbatim
+match across `none` / `on-retry` / `every-attempt` modes). Per-attempt fresh
+feedback requires the critic to actually see what the proposer produced.
+
+Phase 3.8c+ adds a second strategy, `sequential_critic_review`, that runs
+the proposer first and then re-runs the critic on `(chunks + proposer's code
+output)`. The critic prompt asks for issues that cite specific function
+names or line content — abstract pitfalls are no longer enough.
+
+| Strategy | Execution | Critic sees | Wall |
+|---|---|---|---|
+| `asymmetric_debate` (Phase 3.8b) | parallel | chunks only | ≈ max(proposer, critic) |
+| `sequential_critic_review` (Phase 3.8c+) | sequential | chunks + proposer code | ≈ proposer + critic |
+
+Strategy and feedback mode are independent CLI flags:
+
+```bash
+python corpus2skill.py \
+  --theme "Kubernetes pod security standards" \
+  --router-strategy sequential_critic_review \
+  --router-feedback every-attempt
+```
+
+### Smoke run (Phase 3.8c+, kubernetes, commit 7dfd39d)
+
+Same 2-chunk `web_brain_clean` corpus, `sequential_critic_review` +
+`every-attempt`, single attempt that passed L1+L2+L3 on the first try:
+
+| Metric | Phase 3.8b parallel (warm) | Phase 3.8c+ sequential (warm) |
+|---|---|---|
+| `router_wall_sec` | ~194 | **360.6** (proposer 189.0 s + critic 171.0 s) |
+| `proposer.eval_count` | ~1000 | 880 |
+| `critic.eval_count` | 152–197 | **64** (fewer but code-specific) |
+| `critic_findings_count` | 8 | **2** |
+
+The sequential critic returned only 2 findings, but both cite the proposer's
+actual code by name:
+
+> *"`is_pod_admission_mode_compliant` function does not implement any
+> validation logic, despite claiming to check pod compliance."*
+
+The generated skill at `skills/kubernetes_pod_security_standards.py` line 87
+has `pass  # Placeholder for actual implementation logic` — the critic
+caught a real stub.
+
+> *"The code defines `ALLOWED_SECCOMP_TYPES` but doesn't use it when
+> validating `spec.securityContext.seccompProfile.type`."*
+
+`ALLOWED_SECCOMP_TYPES` *is* referenced (line 56), but the validator only
+takes a `seccomp_type` parameter — it never walks a pod spec down to
+`spec.securityContext.seccompProfile.type` as the docs describe. The
+critic flagged a coverage gap (partial truth).
+
+This is exactly the per-attempt fresh feedback Phase 3.8c+ was designed
+to produce: the chunks-only critic could never write "`is_pod_admission_
+mode_compliant` … does not implement validation" because it had no idea
+that function existed.
+
+### Cost / benefit trade-off
+
+| | Parallel + chunks-only | Sequential + code review |
+|---|---|---|
+| Wall per attempt | ~194 s | ~360 s (≈ 1.86×) |
+| Critic tokens | 152–197 | ~64 (2.4× fewer) |
+| Findings | 8 abstract bullets | 2 code-specific bullets |
+| Per-attempt freshness | Near-identical each run | Bound to the proposer's actual output |
+| `every-attempt` Σwall (3 retries) | ~582 s | ~1080 s |
+
+Sequential wins for retry-driven merge loops where each iteration must steer
+the proposer away from real produced bugs. Parallel wins when the goal is
+abstract pitfall enumeration on a frozen corpus. The right choice is a
+function of the workload, which is why both strategies ship side-by-side.
+
+### Schema additions (`router_runs.jsonl`)
+
+`router_runs.jsonl` records now carry `options.execution_mode` (`"sequential"`
+for Phase 3.8c+, absent for Phase 3.8b parallel) and the `strategy_name`
+field already disambiguated. `distill_runs.jsonl` is unchanged at v4.
+
 ## Verified configuration
 
 ### Ollama-via-Aider
