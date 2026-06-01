@@ -41,6 +41,13 @@ Output the pitfall list now:"""
 _CRITIC_LINE_PATTERN = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.MULTILINE)
 
 
+_CRITIC_HINT_HEADER = (
+    "PRIOR INDEPENDENT REVIEWER (a separate model that saw the same chunks) "
+    "FLAGGED THESE PITFALLS PRE-EMPTIVELY. Avoid them in your output:"
+)
+DEFAULT_CRITIC_HINT_MAX_LINES = 10
+
+
 def parse_critic_findings(text: str) -> tuple[str, ...]:
     """Extract ``- ...`` / ``* ...`` bullet lines from critic output.
 
@@ -49,6 +56,29 @@ def parse_critic_findings(text: str) -> tuple[str, ...]:
     asking for bullets only.
     """
     return tuple(m.group(1) for m in _CRITIC_LINE_PATTERN.finditer(text))
+
+
+def format_critic_hint(
+    findings: tuple[str, ...],
+    *,
+    max_lines: int = DEFAULT_CRITIC_HINT_MAX_LINES,
+) -> str:
+    """Format critic findings as a prompt-injection hint block.
+
+    Empty findings -> empty string so the caller can unconditionally
+    concat without branching. Findings beyond ``max_lines`` are clipped
+    to keep the augmented prompt bounded (the critic prompt asks for
+    5-15 lines; clipping at 10 keeps the median while protecting
+    against runaway critic outputs).
+
+    Special characters in findings (backticks, braces, newlines) are
+    preserved verbatim — the hint is plain text, not a format template.
+    """
+    if not findings:
+        return ""
+    clipped = findings[:max_lines]
+    bullets = "\n".join(f"- {f}" for f in clipped)
+    return f"\n\n{_CRITIC_HINT_HEADER}\n{bullets}\n"
 
 
 def build_critic_prompt(*, theme: str, n_chunks: int, joined_chunks: str) -> str:

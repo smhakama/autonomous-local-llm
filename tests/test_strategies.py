@@ -17,9 +17,11 @@ import pytest
 
 from router.runners import ModelOutput
 from router.strategies import (
+    DEFAULT_CRITIC_HINT_MAX_LINES,
     AsymmetricDebateStrategy,
     RouterResult,
     build_critic_prompt,
+    format_critic_hint,
     parse_critic_findings,
 )
 
@@ -97,6 +99,68 @@ def test_build_critic_prompt_substitutes_fields() -> None:
     assert "3 Markdown" in p
     assert "--- chunk body ---" in p
     assert "Output the pitfall list now" in p
+
+
+# -------------------------------------------------------------------------
+# format_critic_hint (Phase 3.8c)
+# -------------------------------------------------------------------------
+
+
+def test_format_critic_hint_empty_returns_empty() -> None:
+    assert format_critic_hint(()) == ""
+
+
+def test_format_critic_hint_single_finding() -> None:
+    out = format_critic_hint(("avoid mutating shared state",))
+    assert "PRIOR INDEPENDENT REVIEWER" in out
+    assert "- avoid mutating shared state" in out
+    # Surrounding blank lines so concatenation with prior prompt is clean.
+    assert out.startswith("\n\n")
+    assert out.endswith("\n")
+
+
+def test_format_critic_hint_multi_findings_preserves_order() -> None:
+    findings = (
+        "do not import asyncio.run inside coroutines",
+        "watch for off-by-one in deque slicing",
+        "subprocess.run requires text=True for str output",
+    )
+    out = format_critic_hint(findings)
+    idx0 = out.index(findings[0])
+    idx1 = out.index(findings[1])
+    idx2 = out.index(findings[2])
+    assert idx0 < idx1 < idx2
+    # Each finding renders as a "- " bullet line.
+    for f in findings:
+        assert f"- {f}" in out
+
+
+def test_format_critic_hint_clips_to_max_lines() -> None:
+    findings = tuple(f"finding {i}" for i in range(15))
+    out = format_critic_hint(findings, max_lines=5)
+    # First 5 present, 6th onward absent.
+    for i in range(5):
+        assert f"- finding {i}" in out
+    for i in range(5, 15):
+        assert f"- finding {i}" not in out
+    # Default clip matches the module-level constant.
+    default_out = format_critic_hint(findings)
+    expected_default_lines = min(len(findings), DEFAULT_CRITIC_HINT_MAX_LINES)
+    assert default_out.count("\n- ") == expected_default_lines
+
+
+def test_format_critic_hint_preserves_special_chars() -> None:
+    findings = (
+        "do not use `eval()` on user input",
+        "{template} placeholders must be escaped",
+        "watch for embedded\nnewlines in returned strings",
+    )
+    out = format_critic_hint(findings)
+    # Backticks/braces/newlines pass through verbatim, no format-substitution
+    # collapse and no escaping.
+    assert "`eval()`" in out
+    assert "{template} placeholders" in out
+    assert "embedded\nnewlines" in out
 
 
 # -------------------------------------------------------------------------
