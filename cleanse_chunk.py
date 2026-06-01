@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""cleanse_chunk.py — Phase 2.5a PoC: deepseek-r1:14b で Qdrant chunks を cleanse.
+"""cleanse_chunk.py — Phase 2.5a PoC: Ollama で Qdrant chunks を cleanse.
 
 Karpathy Layer 2 Wiki Pages 化の技術検証スクリプト。1 chunk = ~3000 chars を
-14B に投入し、ナビゲーション / footer / 広告 / 関連記事 / 重複セクションを
+LLM に投入し、ナビゲーション / footer / 広告 / 関連記事 / 重複セクションを
 除去した cleansed markdown を取得 → 元/cleansed を並列表示 + cosine 比較。
 
 PoC スコープ:
 - Qdrant `web_brain` から N chunks 取得 (default 3)
-- ollama REST /api/generate 経由で deepseek-r1:14b に投入
-- <think>...</think> ブロックを post-process で除去 (DeepSeek-R1 reasoning モデル)
+- ollama REST /api/generate 経由で cleanse 用 model に投入
+  (default qwen2.5:7b-instruct、Phase 3.8b 後の比較実験で deepseek-r1:14b
+   から差し替え、`--cleanse-model` で他 model 試行可)
+- <think>...</think> ブロックを post-process で除去
+  (DeepSeek-R1 系 reasoning モデル用、think 不要 model でも no-op)
 - bge-m3 で 元/cleansed を embed → cosine 計算
 - Qdrant 投入なし (純粋な目視・品質評価のため)
 
@@ -47,7 +50,15 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 QDRANT_HOST = "127.0.0.1"
 QDRANT_PORT = 6333
 COLLECTION = "web_brain"
-CLEANSE_MODEL = "deepseek-r1:14b"
+# Phase 3.8b 後 (2026-06-01): default を deepseek-r1:14b → qwen2.5:7b-instruct
+# に切替。deepseek-r1 は <think>...</think> ブロックで num_predict=1200 を食い潰し、
+# kubernetes pod security standards のサンプル 4 chunks に対して 50% (2/4) しか
+# 成功しなかった (1 件は 1168→3 chars cosine 0.41、1 件は 180s timeout)。
+# qwen2.5:7b-instruct は同じ 4 chunks で 100% 成功、avg cosine 0.9409、合計
+# wall 95.1s (deepseek 445.9s の 21% = 4.7x 高速)。比較データは git log
+# `feat: cleanse_chunk.py default → qwen2.5:7b-instruct` 参照。
+# deepseek-r1:14b を試したい場合は `--cleanse-model deepseek-r1:14b` で opt-in。
+CLEANSE_MODEL = "qwen2.5:7b-instruct"
 EMBED_MODEL = "bge-m3"
 DEFAULT_LIMIT = 20  # Qdrant scroll 上限 (filter 前の input pool)
 GENERATE_TIMEOUT_SEC = 300  # 14B cold load 85s + inference 余裕
@@ -148,13 +159,25 @@ def embed(text: str) -> list[float]:
     return r.json()["embedding"]
 
 
-def cleanse_chunk(text: str, *, timeout: int = GENERATE_TIMEOUT_SEC) -> str:
-    """Call deepseek-r1:14b via Ollama /api/generate, return cleansed text."""
+def cleanse_chunk(
+    text: str,
+    *,
+    timeout: int = GENERATE_TIMEOUT_SEC,
+    model: str = CLEANSE_MODEL,
+) -> str:
+    """Call ``model`` via Ollama /api/generate, return cleansed text.
+
+    ``model`` defaults to ``CLEANSE_MODEL`` (deepseek-r1:14b). Pass a
+    different Ollama model id (e.g. ``qwen2.5:7b-instruct``) when the
+    default's think-block behaviour clips the cleansed output. The
+    ``strip_think_blocks`` post-process is harmless for models that
+    do not emit ``<think>...</think>``.
+    """
     prompt = CLEANSE_PROMPT_TEMPLATE.format(text=text)
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
         json={
-            "model": CLEANSE_MODEL,
+            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": {"num_predict": NUM_PREDICT},
@@ -406,6 +429,7 @@ def cleanse_batch(
     cosine_gate: float = DEFAULT_COSINE_GATE,
     clean_collection: str = DEFAULT_CLEAN_COLLECTION,
     qd_client: QdrantClient | None = None,
+    cleanse_model: str = CLEANSE_MODEL,
 ) -> list[CleanseResult]:
     """セーフティネット込みのバッチ cleanse。
 
@@ -444,7 +468,10 @@ def cleanse_batch(
     selected = eligible[:max_chunks]
     truncated = len(eligible) - len(selected)
 
-    print(f"=== batch_id={batch_id} mode={output_mode} dry_run={dry_run} ===")
+    print(
+        f"=== batch_id={batch_id} mode={output_mode} "
+        f"model={cleanse_model!r} dry_run={dry_run} ==="
+    )
     print(
         f"input={len(chunks)} → filtered_out={len(skipped)} → "
         f"eligible={len(eligible)} → selected={len(selected)} "
@@ -479,7 +506,9 @@ def cleanse_batch(
 
         t0 = time.time()
         try:
-            cleansed = cleanse_chunk(text, timeout=per_chunk_timeout)
+            cleansed = cleanse_chunk(
+                text, timeout=per_chunk_timeout, model=cleanse_model
+            )
             elapsed = time.time() - t0
             cos = 0.0
             if cleansed.strip():
@@ -561,8 +590,9 @@ def cleanse_batch(
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
-            "Phase 2.5b1: cleanse chunks with deepseek-r1:14b "
-            "(セーフティネット付き batch + library)"
+            "Phase 2.5b1: cleanse chunks via Ollama "
+            "(default qwen2.5:7b-instruct、--cleanse-model で差替、"
+            "セーフティネット付き batch + library)"
         )
     )
     ap.add_argument(
@@ -662,6 +692,18 @@ def main() -> int:
             "0.0 で gate 無効)"
         ),
     )
+    # Phase 3.8b 後 (2026-06-01): cleanse model 即乗せ換え用 flag。default は
+    # 後方互換で deepseek-r1:14b、ただし think-block で num_predict を食い潰す
+    # chunk が観測された (kubernetes #0 = 1168→3 chars)。qwen2.5:7b-instruct や
+    # llama3.1:8b など think 不要 model に切替えて挙動比較するために導入。
+    ap.add_argument(
+        "--cleanse-model", default=CLEANSE_MODEL,
+        help=(
+            f"cleanse 役の Ollama model id (default {CLEANSE_MODEL!r})。"
+            "qwen2.5:7b-instruct / llama3.1:8b など think-block を出さない model "
+            "を試す入口。strip_think_blocks は think を出さない model でも安全に no-op。"
+        ),
+    )
     args = ap.parse_args()
 
     raw_kw = (args.filter_heading_keywords or "").strip()
@@ -690,6 +732,7 @@ def main() -> int:
         output_mode=args.output_mode,
         sidecar_path=args.sidecar_path,
         batch_id=args.batch_id,
+        cleanse_model=args.cleanse_model,
         filter_mode=args.filter_mode,
         filter_max_chars=args.filter_max_chars,
         filter_heading_keywords=keywords,
